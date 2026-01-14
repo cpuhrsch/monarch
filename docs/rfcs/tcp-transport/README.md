@@ -1,126 +1,195 @@
-# TCP Transport Implementation Plan
+# TCP Transport Implementation
 
 ## Summary
 
-Add TCP as a fallback transport for RDMA operations when RDMA NIC is unavailable.
-
-**Key decisions:**
-- Reuse hyperactor TCP infrastructure (`FrameReader`/`FrameWrite`)
-- Per-operation transport selection via `transport` parameter
-- Automatic fallback: `"best"` uses NIC if available, TCP otherwise
+TCP transport has been added as a fallback for RDMA operations, implemented entirely in Python using existing Monarch actor APIs. The implementation supports both local (same-process) and remote (cross-process) data transfer.
 
 ## Transport Types
 
 ```python
-Transport = Literal["best", "tcp", "tcp+", "nic", "nic+", "nvlink"]
+Transport = Literal["best", "tcp", "nic"]
 ```
 
-| Value | Meaning |
-|-------|---------|
-| `best` | Auto-select best available (default) |
-| `tcp` | Force TCP |
-| `tcp+` | TCP or faster |
-| `nic` | Force RDMA NIC (error if unavailable) |
-| `nic+` | RDMA NIC or faster |
-| `nvlink` | NVLink (future) |
+| Value | Behavior |
+|-------|----------|
+| `"best"` | Auto-select: RDMA NIC if available, else TCP (default) |
+| `"tcp"` | Force TCP transport |
+| `"nic"` | Force RDMA NIC (raises `RuntimeError` if unavailable) |
 
 ## API Changes
 
-```python
-# Before
-buffer.read_into(dst, timeout=3)
+### RDMABuffer
 
-# After
+```python
+# New transport parameter (default: "best")
 buffer.read_into(dst, timeout=3, transport="best")
+buffer.write_from(src, timeout=3, transport="best")
+```
+
+### RDMAAction
+
+```python
+# Default transport in constructor
+action = RDMAAction(transport="best")
+
+# Per-operation override
+action.read_into(buffer, dst, transport="tcp")
+action.write_from(buffer, src, transport="nic")
 ```
 
 ## Architecture
 
+### Cross-Process TCP Transport
+
 ```
-Python API (transport param)
-    ↓
-Rust Bindings (parse transport string)
-    ↓
-RdmaBuffer.read_into_with_transport()
-    ↓
-select_transport() → Transport::Nic or Transport::Tcp
-    ↓
-┌─────────────────────┬─────────────────────┐
-│  RDMA NIC Path      │  TCP Fallback Path  │
-│  (existing code)    │  (new)              │
-│  - QueuePair.put()  │  - TcpDataTransport │
-│  - ibverbs ops      │  - FrameWrite       │
-└─────────────────────┴─────────────────────┘
-```
+Host A (Buffer Owner)                    Host B (Caller)
+─────────────────────                    ───────────────
+RDMABuffer created
+  → registers with TcpDataActor
+  → stores actor ref in buffer
 
-## Files to Create
+buffer sent to Host B ──────────────────→ buffer received
+                                           (with TcpDataActor ref)
 
-| File | Purpose |
-|------|---------|
-| `monarch_rdma/src/transport.rs` | Transport enum and selection logic |
-| `monarch_rdma/src/tcp_transport.rs` | TCP bulk data transfer |
-| `python/tests/test_rdma_tcp_transport.py` | Integration tests |
+                                         buffer.read_into(dst, transport="tcp")
+                                           │
+                                           ├─ Check local registry (miss)
+                                           │
+                                           └─ Call tcp_actor.fetch_buffer_data()
+                                                      │
+tcp_actor receives call ←──────────────────────────────┘
+  → reads from _local_buffers
+  → returns bytes
 
-## Files to Modify
-
-| File | Changes |
-|------|---------|
-| `monarch_rdma/src/lib.rs` | Add new modules |
-| `monarch_rdma/src/rdma_components.rs` | Add `*_with_transport` methods |
-| `monarch_rdma/src/rdma_manager_actor.rs` | TCP transport + message handlers |
-| `monarch_rdma/extension/lib.rs` | Add `transport` param to bindings |
-| `python/monarch/_src/rdma/rdma.py` | Add `transport` param to API |
-| `python/monarch/_rust_bindings/rdma.pyi` | Update type stubs |
-
-## Implementation Phases
-
-### Phase 1: Transport Abstraction
-Create `transport.rs` with:
-- `Transport` enum
-- `select_transport(requested, local_has_nic, remote_has_nic) -> Transport`
-
-### Phase 2: TCP Transport
-Create `tcp_transport.rs`:
-- Reuse `hyperactor::channel::net::framed::{FrameReader, FrameWrite}`
-- Connection pooling per remote actor
-- `TcpDataTransport::send_data()` / `recv_data()`
-
-### Phase 3: RdmaBuffer Extension
-Add to `rdma_components.rs`:
-- `RdmaBuffer::read_into_with_transport()`
-- `RdmaBuffer::write_from_with_transport()`
-- Private `read_into_tcp()` / `write_from_tcp()` methods
-
-### Phase 4: Manager Actor
-Add to `rdma_manager_actor.rs`:
-- `tcp_transport: Option<TcpDataTransport>` field
-- `RequestTcpTransfer` message handler
-- `ExchangeTcpEndpoint` for capability discovery
-
-### Phase 5: Python Bindings
-Update `extension/lib.rs`:
-- Add `transport: &str` parameter (default `"best"`)
-- Add `parse_transport()` helper
-
-### Phase 6: Python API
-Update `rdma.py`:
-- Add `Transport` type alias
-- Add `transport` parameter to `read_into()`, `write_from()`
-- Update `RDMAAction` methods
-
-## Testing
-
-```bash
-# Existing tests (regression check)
-pytest python/tests/test_rdma.py -v
-
-# New TCP transport tests
-pytest python/tests/test_rdma_tcp_transport.py -v
+                                         ←─ receives bytes
+                                         ←─ copies to dst
 ```
 
-Test cases:
-1. Explicit TCP transport works
-2. `"best"` falls back to TCP when NIC unavailable
-3. `"nic"` fails when RDMA unavailable
-4. Large data transfers over TCP
-5. Concurrent TCP operations
+### Components
+
+1. **TcpDataActor**: Per-process actor that holds buffer data and handles remote fetch/write requests
+2. **Buffer Registry**: Local dict for fast same-process access
+3. **Actor Reference**: Stored in RDMABuffer, serializes across processes
+
+## Implementation Details
+
+### Buffer Creation
+
+```python
+class RDMABuffer:
+    def __init__(self, data):
+        # ... RDMA setup ...
+
+        # Store buffer ID and dtype for TCP
+        self._buffer_id = self._buffer.name
+        self._dtype = data.dtype if isinstance(data, torch.Tensor) else None
+
+        # Register in local registry (fast path)
+        _buffer_registry[self._buffer_id] = data
+
+        # Get TcpDataActor and register (for remote access)
+        self._tcp_data_actor = _get_tcp_data_actor_blocking()
+        self._tcp_data_actor.register_buffer.call_one(self._buffer_id, data)
+```
+
+### TCP Read (read_into)
+
+```python
+async def read_into_tcp_impl():
+    # Fast path: check local registry
+    local_data = _buffer_registry.get(buffer_id)
+
+    if local_data is not None:
+        # Same process - direct copy
+        dst.copy_(local_data)
+    else:
+        # Cross process - call remote TcpDataActor
+        data_bytes = await tcp_actor.fetch_buffer_data.call_one(buffer_id)
+        dst.copy_(torch.frombuffer(bytearray(data_bytes), dtype=dtype))
+```
+
+### TCP Write (write_from)
+
+```python
+async def write_from_tcp_impl():
+    # Fast path: check local registry
+    dst_data = _buffer_registry.get(buffer_id)
+
+    if dst_data is not None:
+        # Same process - direct copy
+        dst_data.copy_(src)
+    else:
+        # Cross process - call remote TcpDataActor
+        src_bytes = src.numpy().tobytes()
+        await tcp_actor.write_buffer_data.call_one(buffer_id, src_bytes)
+```
+
+## Files Modified
+
+- `python/monarch/_src/rdma/rdma.py`:
+  - Added `Transport` type alias
+  - Added `_buffer_registry` for local fast path
+  - Added `TcpDataActor` class with `register_buffer`, `unregister_buffer`, `fetch_buffer_data`, `write_buffer_data` endpoints
+  - Added `_get_tcp_data_actor_future()` and `_get_tcp_data_actor_blocking()` helpers
+  - Modified `RDMABuffer.__init__` to register with TcpDataActor
+  - Added `transport` parameter to `read_into()` and `write_from()`
+  - Added `_should_use_tcp()`, `_read_into_tcp()`, `_write_from_tcp()` methods
+  - Updated `drop()` to unregister from TcpDataActor
+  - Modified `RDMAAction` to support transport parameter
+
+## Usage Examples
+
+### Basic Cross-Process Usage
+
+```python
+# Host A: Parameter Server
+class ParameterServer(Actor):
+    def __init__(self):
+        self.weights = torch.randn(1000, 1000)
+        self.buffer = RDMABuffer(self.weights.view(torch.uint8).flatten())
+
+    @endpoint
+    async def get_weights_buffer(self) -> RDMABuffer:
+        return self.buffer
+
+# Host B: Worker
+class Worker(Actor):
+    @endpoint
+    async def fetch_weights(self, server: ParameterServer):
+        buffer = await server.get_weights_buffer.call_one()
+
+        local_weights = torch.zeros(1000, 1000)
+        # Works with TCP transport - calls remote TcpDataActor
+        await buffer.read_into(
+            local_weights.view(torch.uint8).flatten(),
+            transport="tcp"
+        )
+```
+
+### Batch Operations
+
+```python
+from monarch._src.rdma.rdma import RDMAAction
+
+# Create action with default TCP transport
+action = RDMAAction(transport="tcp")
+action.read_into(buffer_a, dst_a)
+action.write_from(buffer_b, src_b)
+action.submit().get()
+```
+
+## Performance Characteristics
+
+| Aspect | RDMA (NIC) | TCP (Same Process) | TCP (Cross Process) |
+|--------|------------|--------------------|--------------------|
+| Latency | Very low | Very low (direct copy) | Higher (serialization + network) |
+| Throughput | High | High | Lower (Python serialization) |
+| CPU Usage | Minimal | Low | Higher (data conversion) |
+| Dependencies | RDMA NIC | None | None |
+
+## Notes
+
+- **torch is a required dependency** (package is named "torchmonarch")
+- TCP transport adds overhead for cross-process transfers but works universally
+- Same-process TCP is optimized via local registry (no serialization)
+- The TcpDataActor is spawned lazily on first buffer creation

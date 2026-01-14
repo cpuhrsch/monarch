@@ -10,7 +10,7 @@ import functools
 import logging
 import warnings
 from collections import defaultdict
-from typing import Any, cast, List, Optional, Tuple
+from typing import Any, cast, List, Literal, Optional, Tuple, Union
 
 import torch
 from monarch._rust_bindings.monarch_hyperactor.pytokio import PythonTask, Shared
@@ -44,6 +44,17 @@ class RDMAWriteTransferWarning(Warning):
 
 warnings.simplefilter("once", RDMAReadTransferWarning)
 warnings.simplefilter("once", RDMAWriteTransferWarning)
+
+
+# Transport type for selecting data transfer mechanism
+# - "best": Auto-select best available (RDMA NIC if available, else TCP)
+# - "tcp": Force TCP transport (uses actor messaging)
+# - "nic": Force RDMA NIC (error if unavailable)
+Transport = Literal["best", "tcp", "nic"]
+
+# Per-process registry mapping buffer IDs to tensor data for TCP fallback
+# Key is the buffer's unique identifier, value is the original tensor/memoryview
+_buffer_registry: Dict[str, Union[torch.Tensor, memoryview]] = {}
 
 
 def is_rdma_available():
@@ -143,6 +154,80 @@ class RdmaController(Actor):
             self._manager_futures[proc_mesh] = Future(coro=create_manager())
 
         await self._manager_futures[proc_mesh]
+
+
+class TcpDataActor(Actor):
+    """
+    Per-process actor for handling TCP-based data transfer as fallback for RDMA.
+
+    This actor provides endpoints for fetching and writing buffer data when
+    RDMA NIC is not available or when TCP transport is explicitly requested.
+    """
+
+    def __init__(self) -> None:
+        # Local buffers registered for TCP access on this process
+        self._local_buffers: Dict[str, Union[torch.Tensor, memoryview]] = {}
+
+    @endpoint
+    async def register_buffer(
+        self, buffer_id: str, data: torch.Tensor
+    ) -> None:
+        """Register a buffer for TCP access."""
+        self._local_buffers[buffer_id] = data
+
+    @endpoint
+    async def unregister_buffer(self, buffer_id: str) -> None:
+        """Unregister a buffer from TCP access."""
+        self._local_buffers.pop(buffer_id, None)
+
+    @endpoint
+    async def fetch_buffer_data(self, buffer_id: str) -> bytes:
+        """
+        Fetch buffer data for TCP transfer.
+
+        Returns the buffer contents as bytes.
+        """
+        data = self._local_buffers.get(buffer_id)
+        if data is None:
+            raise ValueError(f"Buffer {buffer_id} not found in TCP registry")
+
+        if isinstance(data, torch.Tensor):
+            # Convert tensor to bytes
+            return data.numpy().tobytes()
+        else:
+            # memoryview - convert to bytes
+            return bytes(data)
+
+    @endpoint
+    async def write_buffer_data(self, buffer_id: str, data: bytes) -> None:
+        """
+        Write data to buffer via TCP.
+
+        Copies the provided bytes into the registered buffer.
+        """
+        buf = self._local_buffers.get(buffer_id)
+        if buf is None:
+            raise ValueError(f"Buffer {buffer_id} not found in TCP registry")
+
+        if isinstance(buf, torch.Tensor):
+            # Create tensor from bytes and copy
+            src = torch.frombuffer(bytearray(data), dtype=buf.dtype).reshape(buf.shape)
+            buf.copy_(src)
+        else:
+            # memoryview - direct copy
+            buf[:] = data
+
+
+# Cached helper to get or spawn the per-process TcpDataActor
+@functools.cache
+def _get_tcp_data_actor_future() -> "Future[TcpDataActor]":
+    """Get or spawn the TcpDataActor for this process (returns Future)."""
+    return get_or_spawn_controller("tcp_data_actor", TcpDataActor)
+
+
+def _get_tcp_data_actor_blocking() -> "TcpDataActor":
+    """Get or spawn the TcpDataActor for this process (blocking)."""
+    return _get_tcp_data_actor_future().get()
 
 
 def pt_cuda_allocator_compatibility() -> bool:
@@ -252,6 +337,24 @@ class RDMABuffer:
                 proc_id=ctx.actor_instance.proc_id,
                 client=ctx.actor_instance,
             )
+
+            # Store metadata for TCP fallback transport
+            # Use the Rust buffer's name as unique identifier
+            self._buffer_id: str = self._buffer.name
+            self._dtype: Optional[torch.dtype] = (
+                data.dtype if isinstance(data, torch.Tensor) else None
+            )
+
+            # Register in global buffer registry for local TCP access
+            _buffer_registry[self._buffer_id] = data
+
+            # Get the TcpDataActor for this process and register the buffer
+            # The actor reference is serializable and can be sent to remote processes
+            self._tcp_data_actor: TcpDataActor = _get_tcp_data_actor_blocking()
+            # Register asynchronously (fire and forget for now)
+            # The data is also in _buffer_registry for immediate local access
+            self._tcp_data_actor.register_buffer.call_one(self._buffer_id, data)
+
         # TODO - specific exception
         except Exception as e:
             logging.error("Failed to create buffer %s", e)
@@ -265,6 +368,7 @@ class RDMABuffer:
         dst: torch.Tensor | memoryview,
         *,
         timeout: int = 3,
+        transport: Transport = "best",
     ) -> Future[Optional[int]]:
         """
         Read data from the RDMABuffer into a destination tensor.
@@ -274,11 +378,17 @@ class RDMABuffer:
             dst: Destination tensor or memoryview to read into.
         Keyword Args:
             timeout (int, optional): Timeout in seconds for the operation. Defaults to 3s.
+            transport (Transport, optional): Transport to use for the operation.
+                - "best": Auto-select best available (RDMA NIC if available, else TCP)
+                - "tcp": Force TCP transport (uses actor messaging)
+                - "nic": Force RDMA NIC (error if unavailable)
+                Defaults to "best".
         Returns:
             Future[Optional[int]]: A Monarch Future that can be awaited or called with .get() for blocking operation.
 
         Raises:
             ValueError: If the destination tensor size is smaller than the RDMA buffer size.
+            RuntimeError: If transport="nic" but RDMA is not available.
 
         Note:
             Currently only CPU tensors are fully supported. GPU tensors will be temporarily
@@ -291,6 +401,35 @@ class RDMABuffer:
                 f"Destination tensor size ({dst_size}) must be >= RDMA buffer size ({self.size()})"
             )
 
+        # Determine which transport to use
+        use_tcp = self._should_use_tcp(transport)
+
+        if use_tcp:
+            return self._read_into_tcp(dst, timeout)
+        else:
+            return self._read_into_rdma(dst, dst_addr, dst_size, timeout)
+
+    def _should_use_tcp(self, transport: Transport) -> bool:
+        """Determine if TCP transport should be used based on transport setting."""
+        if transport == "tcp":
+            return True
+        elif transport == "nic":
+            if not is_rdma_available():
+                raise RuntimeError(
+                    "Transport 'nic' requested but RDMA is not available on this platform"
+                )
+            return False
+        else:  # "best"
+            return not is_rdma_available()
+
+    def _read_into_rdma(
+        self,
+        dst: torch.Tensor | memoryview,
+        dst_addr: int,
+        dst_size: int,
+        timeout: int,
+    ) -> Future[Optional[int]]:
+        """Read using RDMA NIC transport (existing implementation)."""
         local_proc_id = context().actor_instance.proc_id
         client = context().actor_instance
 
@@ -308,11 +447,54 @@ class RDMABuffer:
 
         return Future(coro=read_into_nonblocking())
 
+    def _read_into_tcp(
+        self,
+        dst: torch.Tensor | memoryview,
+        timeout: int,
+    ) -> Future[Optional[int]]:
+        """Read using TCP transport (actor messaging fallback)."""
+        buffer_id = self._buffer_id
+        dtype = self._dtype
+        tcp_actor = self._tcp_data_actor
+
+        async def read_into_tcp_impl() -> Optional[int]:
+            # Try local registry first (fast path for same-process)
+            local_data = _buffer_registry.get(buffer_id)
+
+            if local_data is not None:
+                # Local access - direct copy
+                if isinstance(dst, torch.Tensor) and isinstance(local_data, torch.Tensor):
+                    dst.copy_(local_data)
+                elif isinstance(dst, memoryview) and isinstance(local_data, memoryview):
+                    dst[:] = local_data
+                elif isinstance(dst, torch.Tensor):
+                    src_tensor = torch.frombuffer(bytearray(local_data), dtype=dst.dtype)
+                    dst.copy_(src_tensor)
+                else:
+                    dst[:] = local_data.numpy().tobytes()
+            else:
+                # Remote access - call TcpDataActor on owner's process
+                data_bytes: bytes = await tcp_actor.fetch_buffer_data.call_one(buffer_id)
+
+                # Copy received bytes to destination
+                if isinstance(dst, torch.Tensor):
+                    src_tensor = torch.frombuffer(
+                        bytearray(data_bytes), dtype=dtype or dst.dtype
+                    )
+                    dst.copy_(src_tensor)
+                else:
+                    dst[:] = data_bytes
+
+            return None
+
+        return Future(coro=read_into_tcp_impl())
+
     def write_from(
         self,
         src: torch.Tensor | memoryview,
         *,
         timeout: int = 3,
+        transport: Transport = "best",
     ) -> Future[None]:
         """
         Write data from a source tensor into the RDMABuffer.
@@ -323,6 +505,11 @@ class RDMABuffer:
                                 Either src or addr/size must be provided.
         Keyword Args:
             timeout (int, optional): Timeout in seconds for the operation. Defaults to 3s.
+            transport (Transport, optional): Transport to use for the operation.
+                - "best": Auto-select best available (RDMA NIC if available, else TCP)
+                - "tcp": Force TCP transport (uses actor messaging)
+                - "nic": Force RDMA NIC (error if unavailable)
+                Defaults to "best".
 
         Returns:
             Future[None]: A Monarch Future object that can be awaited or called with .get()
@@ -330,6 +517,7 @@ class RDMABuffer:
 
         Raises:
             ValueError: If the source tensor size exceeds the RDMA buffer size.
+            RuntimeError: If transport="nic" but RDMA is not available.
 
         Note:
             Currently only CPU tensors are fully supported. GPU tensors will be temporarily
@@ -342,6 +530,23 @@ class RDMABuffer:
             raise ValueError(
                 f"Source tensor size ({src_size}) must be <= RDMA buffer size ({self.size()})"
             )
+
+        # Determine which transport to use
+        use_tcp = self._should_use_tcp(transport)
+
+        if use_tcp:
+            return self._write_from_tcp(src, timeout)
+        else:
+            return self._write_from_rdma(src, src_addr, src_size, timeout)
+
+    def _write_from_rdma(
+        self,
+        src: torch.Tensor | memoryview,
+        src_addr: int,
+        src_size: int,
+        timeout: int,
+    ) -> Future[None]:
+        """Write using RDMA NIC transport (existing implementation)."""
         local_proc_id = context().actor_instance.proc_id
         client = context().actor_instance
 
@@ -359,12 +564,52 @@ class RDMABuffer:
 
         return Future(coro=write_from_nonblocking())
 
+    def _write_from_tcp(
+        self,
+        src: torch.Tensor | memoryview,
+        timeout: int,
+    ) -> Future[None]:
+        """Write using TCP transport (actor messaging fallback)."""
+        buffer_id = self._buffer_id
+        tcp_actor = self._tcp_data_actor
+
+        async def write_from_tcp_impl() -> None:
+            # Try local registry first (fast path for same-process)
+            dst_data = _buffer_registry.get(buffer_id)
+
+            if dst_data is not None:
+                # Local access - direct copy
+                if isinstance(dst_data, torch.Tensor) and isinstance(src, torch.Tensor):
+                    dst_data.copy_(src)
+                elif isinstance(dst_data, memoryview) and isinstance(src, memoryview):
+                    dst_data[:] = src
+                elif isinstance(dst_data, torch.Tensor):
+                    src_tensor = torch.frombuffer(bytearray(src), dtype=dst_data.dtype)
+                    dst_data.copy_(src_tensor)
+                else:
+                    dst_data[:] = src.numpy().tobytes()
+            else:
+                # Remote access - call TcpDataActor on owner's process
+                # Convert source to bytes
+                if isinstance(src, torch.Tensor):
+                    src_bytes = src.numpy().tobytes()
+                else:
+                    src_bytes = bytes(src)
+
+                await tcp_actor.write_buffer_data.call_one(buffer_id, src_bytes)
+
+        return Future(coro=write_from_tcp_impl())
+
     def drop(self) -> Future[None]:
         """
         Release the handle on the memory that the src holds to this memory.
+
+        This also removes the buffer from the TCP registry if it was registered.
         """
         local_proc_id = context().actor_instance.proc_id
         client = context().actor_instance
+        buffer_id = self._buffer_id
+        tcp_actor = self._tcp_data_actor
 
         async def drop_nonblocking() -> None:
             await _ensure_init_rdma_manager()
@@ -373,6 +618,12 @@ class RDMABuffer:
                 local_proc_id=local_proc_id,
                 client=client,
             )
+
+            # Clean up local TCP registry entry
+            _buffer_registry.pop(buffer_id, None)
+
+            # Unregister from TcpDataActor
+            await tcp_actor.unregister_buffer.call_one(buffer_id)
 
         return Future(coro=drop_nonblocking())
 
@@ -392,6 +643,9 @@ class RDMAAction:
     Schedule a bunch of actions at once. This provides an opportunity to
     optimize bulk RDMA transactions without exposing complexity to users.
 
+    Args:
+        transport: Default transport to use for all operations. Can be overridden
+            per-operation. Defaults to "best".
     """
 
     class RDMAOp(Enum):
@@ -402,9 +656,12 @@ class RDMAAction:
         FETCH_ADD = "fetch_add"
         COMPARE_AND_SWAP = "compare_and_swap"
 
-    def __init__(self) -> None:
-        self._instructs: List[Tuple[RDMAAction.RDMAOp, RDMABuffer, LocalMemory]] = []
+    def __init__(self, transport: Transport = "best") -> None:
+        self._instructs: List[
+            Tuple[RDMAAction.RDMAOp, RDMABuffer, LocalMemory, Transport]
+        ] = []
         self._memory_dependencies: Dict[Tuple[int, int], RDMAAction.RDMAOp] = {}
+        self._default_transport: Transport = transport
 
     def _check_and_merge_overlapping_range(
         self, addr: int, size: int, op: "RDMAAction.RDMAOp"
@@ -458,7 +715,12 @@ class RDMAAction:
             expanded_range[0], expanded_range[1] - expanded_range[0], op
         )
 
-    def read_into(self, src: RDMABuffer, dst: LocalMemory | List[LocalMemory]) -> Self:
+    def read_into(
+        self,
+        src: RDMABuffer,
+        dst: LocalMemory | List[LocalMemory],
+        transport: Optional[Transport] = None,
+    ) -> Self:
         """
         Read from src RDMA buffer into dst memory.
 
@@ -466,6 +728,8 @@ class RDMAAction:
             src: Source RDMA buffer to read from
             dst: Destination local memory to read into
                    If dst is a list, it is the concatenation of the data in the list
+            transport: Transport to use for this operation. If None, uses the
+                default transport set in __init__. Defaults to None.
         """
         # Throw NotImplementedError for lists to simplify logic
         if isinstance(dst, list):
@@ -480,11 +744,17 @@ class RDMAAction:
 
         self._check_and_merge_overlapping_range(addr, size, self.RDMAOp.READ_INTO)
 
-        self._instructs.append((self.RDMAOp.READ_INTO, src, dst))
+        effective_transport = transport if transport is not None else self._default_transport
+        self._instructs.append((self.RDMAOp.READ_INTO, src, dst, effective_transport))
 
         return self
 
-    def write_from(self, src: RDMABuffer, dst: LocalMemory | List[LocalMemory]) -> Self:
+    def write_from(
+        self,
+        src: RDMABuffer,
+        dst: LocalMemory | List[LocalMemory],
+        transport: Optional[Transport] = None,
+    ) -> Self:
         """
         Write from dst memory to src RDMA buffer.
 
@@ -492,6 +762,8 @@ class RDMAAction:
             src: Destination RDMA buffer to write to
             dst: Source local memory to write from
                    If local is a list, it is the concatenation of the data in the list
+            transport: Transport to use for this operation. If None, uses the
+                default transport set in __init__. Defaults to None.
         """
         # Throw NotImplementedError for lists to simplify logic
         if isinstance(dst, list):
@@ -506,7 +778,8 @@ class RDMAAction:
 
         self._check_and_merge_overlapping_range(addr, size, self.RDMAOp.WRITE_FROM)
 
-        self._instructs.append((self.RDMAOp.WRITE_FROM, src, dst))
+        effective_transport = transport if transport is not None else self._default_transport
+        self._instructs.append((self.RDMAOp.WRITE_FROM, src, dst, effective_transport))
 
         return self
 
@@ -564,11 +837,11 @@ class RDMAAction:
             work = defaultdict(list)
 
             # Group operations by owner for concurrent execution per owner
-            for op, src, dst in self._instructs:
+            for op, src, dst, transport in self._instructs:
                 if op == self.RDMAOp.READ_INTO:
-                    fut = src.read_into(dst)
+                    fut = src.read_into(dst, transport=transport)
                 elif op == self.RDMAOp.WRITE_FROM:
-                    fut = src.write_from(dst)
+                    fut = src.write_from(dst, transport=transport)
                 else:
                     raise NotImplementedError(f"Unknown RDMA operation: {op}")
                 work[src.owner].append(fut)
