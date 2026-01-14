@@ -15,6 +15,7 @@ from typing import Any, Dict, FrozenSet, List, Optional, Sequence
 
 from monarch._rust_bindings.monarch_hyperactor.channel import ChannelTransport
 from monarch._rust_bindings.monarch_hyperactor.config import configure
+
 from monarch._src.actor.bootstrap import attach_to_workers
 from monarch._src.job.job import JobState, JobTrait
 
@@ -152,9 +153,9 @@ class SlurmJob(JobTrait):
             and self._gpus_per_node is not None
         ):
             gpus_per_task = self._gpus_per_node // self._ntasks_per_node
-            assert self._partition, (
-                "Slurm partition must be set for jobs that share nodes with other jobs"
-            )
+            assert (
+                self._partition
+            ), "Slurm partition must be set for jobs that share nodes with other jobs"
             self.share_node(
                 tasks_per_node=self._ntasks_per_node,
                 gpus_per_task=gpus_per_task,
@@ -166,8 +167,19 @@ class SlurmJob(JobTrait):
             if arg.startswith("-"):
                 sbatch_directives.append(f"#SBATCH {arg}")
 
+        # my_conda_env = "/home/cpuhrsch/miniconda3/envs/nightly20251119cu126py310"
+        # my_conda_env = "/home/cpuhrsch/miniconda3/envs/monarch20251201py310"
+        my_conda_env = "/home/cpuhrsch/miniconda3/envs/monarch20260102py312"
+        extra_library_include_paths = ["/lib/python3.12/site-packages/torch/lib",
+                                       "/lib/python3.12/site-packages/nvidia/nccl/lib",
+                                      "/lib"]
         batch_script = "\n".join(sbatch_directives)
         batch_script += f"\nsrun {self._python_exe} -c '{python_command}'\n"
+        extra_library_env = "FUSE_LIBRARY_PATH=/home/cpuhrsch/download/temp_fuse/lib/x86_64-linux-gnu/libfuse.so.2 "
+        extra_library_env += "LD_LIBRARY_PATH=$LD_LIBRARY_PATH:" + ":".join([my_conda_env + l for l in extra_library_include_paths])
+        batch_script += "\nulimit -l unlimited\n"
+        batch_script += f"\nsrun --cpu-bind=none env {extra_library_env} {self._python_exe} -c '{python_command}'\n"
+        print(batch_script)
 
         logger.info(f"Submitting SLURM job with {num_nodes} nodes")
 
