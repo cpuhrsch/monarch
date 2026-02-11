@@ -319,6 +319,7 @@ setup(
     version=package_version,
     ext_modules=ext_modules,
     rust_extensions=rust_extensions,
+    include_package_data=True,
     cmdclass={
         "build_ext": build_ext,
         "clean": Clean,

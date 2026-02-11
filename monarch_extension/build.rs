@@ -12,5 +12,29 @@ fn main() {
         // Set up static linking for rdma-core
         // This emits link directives for libmlx5.a, libibverbs.a, librdma_util.a
         let _config = build_utils::setup_cpp_static_libs();
+
+        // Link libfabric statically for EFA support.
+        // Try DEP_RDMAXCEL_LIBFABRIC_A from rdmaxcel-sys metadata first,
+        // then fall back to searching the rdmaxcel-sys build output.
+        let libfabric_a = std::env::var("DEP_RDMAXCEL_LIBFABRIC_A").ok()
+            .or_else(|| {
+                // Fallback: find it relative to the rdmaxcel-sys manifest
+                let manifest = std::env::var("CARGO_MANIFEST_DIR").ok()?;
+                let path = format!("{}/../rdmaxcel-sys/target/libfabric_build/libfabric-install/lib/libfabric.a", manifest);
+                if std::path::Path::new(&path).exists() {
+                    Some(std::fs::canonicalize(&path).ok()?.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            });
+
+        if let Some(path) = libfabric_a {
+            if std::path::Path::new(&path).exists() {
+                println!("cargo:warning=Linking libfabric from {}", path);
+                println!("cargo:rustc-link-arg=-Wl,--whole-archive");
+                println!("cargo:rustc-link-arg={}", path);
+                println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
+            }
+        }
     }
 }

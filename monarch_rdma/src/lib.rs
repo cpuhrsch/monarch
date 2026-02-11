@@ -10,6 +10,9 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 pub mod device_selection;
+pub mod efa;
+pub mod efa_components;
+pub mod efa_manager_actor;
 mod ibverbs_primitives;
 mod rdma_components;
 mod rdma_manager_actor;
@@ -26,6 +29,16 @@ pub use rdma_manager_actor::*;
 // Re-export rdmaxcel_sys for extension crate to access types
 pub use rdmaxcel_sys;
 pub use test_utils::is_cuda_available;
+
+// Re-export EFA support check from rdmaxcel_sys
+pub use rdmaxcel_sys::efa_supported;
+
+// Re-export EFA types from efa module
+pub use efa::{EfaEndpoint, EfaError, EfaResult, efa_available};
+
+// Re-export EFA actor types
+pub use efa_components::EfaBuffer;
+pub use efa_manager_actor::{EfaManagerActor, EfaManagerMessage};
 
 /// Print comprehensive RDMA device information for debugging.
 /// Controlled by MONARCH_DEBUG_RDMA environment variable.

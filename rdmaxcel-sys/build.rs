@@ -10,6 +10,111 @@ use std::env;
 use std::path::Path;
 use std::path::PathBuf;
 
+const LIBFABRIC_REPO: &str = "https://github.com/aws/libfabric";
+const LIBFABRIC_TAG: &str = "v1.22.0amzn4.0";
+
+/// Run a command, returning Ok(()) on success or Err with stderr on failure.
+#[cfg(not(target_os = "macos"))]
+fn run_cmd(cmd: &mut std::process::Command) -> Result<(), String> {
+    let output = cmd.output().map_err(|e| format!("failed to execute: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+/// Build libfabric from source and return (include_dir, lib_dir).
+/// Caches the build at rdmaxcel-sys/target/libfabric_build/.
+/// Returns None if the build fails (EFA will be disabled).
+#[cfg(not(target_os = "macos"))]
+fn build_libfabric() -> Option<(String, String)> {
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let base = format!("{}/target/libfabric_build", manifest_dir);
+    let src = format!("{}/libfabric", base);
+    let build_dir = format!("{}/libfabric-build", base);
+    let install = format!("{}/libfabric-install", base);
+    let lib_a = format!("{}/lib/libfabric.a", install);
+
+    // Return cached build if available
+    if Path::new(&lib_a).exists() {
+        return Some((format!("{}/include", install), format!("{}/lib", install)));
+    }
+
+    std::fs::create_dir_all(&base).expect("Failed to create libfabric build dir");
+
+    // Clone source if needed
+    if !Path::new(&format!("{}/configure.ac", src)).exists() {
+        let tag = env::var("MONARCH_LIBFABRIC_TAG").unwrap_or(LIBFABRIC_TAG.to_string());
+        println!("cargo:warning=Cloning libfabric from {LIBFABRIC_REPO} (tag {tag})");
+        run_cmd(std::process::Command::new("git").args([
+            "clone", "--depth=1", "--branch", &tag, LIBFABRIC_REPO, &src,
+        ])).ok()?;
+    }
+
+    // Generate configure script
+    if !Path::new(&format!("{}/configure", src)).exists() {
+        println!("cargo:warning=Running libfabric autogen.sh...");
+        run_cmd(std::process::Command::new("bash").arg("autogen.sh").current_dir(&src)).ok()?;
+    }
+
+    // Configure
+    std::fs::create_dir_all(&build_dir).ok()?;
+    std::fs::create_dir_all(&install).ok()?;
+    println!("cargo:warning=Configuring libfabric...");
+    run_cmd(
+        std::process::Command::new(format!("{}/configure", src))
+            .args([
+                &format!("--prefix={}", install),
+                "--enable-static", "--disable-shared", "--with-pic",
+                "--enable-efa=yes",
+                // Disable unneeded providers to speed up build
+                "--enable-tcp=no", "--enable-udp=no", "--enable-sockets=no",
+                "--enable-rxm=no", "--enable-mrail=no", "--enable-rxd=no",
+                "--enable-shm=no", "--enable-rstream=no", "--enable-perf=no",
+                "--enable-hook_debug=no", "--enable-dmabuf_peer_mem=no",
+            ])
+            // Disable symbol versioning so rust-lld can link the static library.
+            // HAVE_SYMVER_SUPPORT controls the .symver asm directives in ofi_abi.h.
+            .env("CFLAGS", "-fPIC -O2")
+            .current_dir(&build_dir),
+    ).ok()?;
+
+    // Patch config.h to:
+    // 1. Disable symbol versioning so rust-lld can link without version scripts
+    // 2. Force all providers as builtin (not DSO) so they auto-register at init
+    let config_h = format!("{}/config.h", build_dir);
+    if Path::new(&config_h).exists() {
+        let content = std::fs::read_to_string(&config_h).unwrap_or_default();
+        let patched = content
+            .replace("#define HAVE_SYMVER_SUPPORT 1", "#define HAVE_SYMVER_SUPPORT 0")
+            .replace("#define HAVE_EFA_DL 1", "#define HAVE_EFA_DL 0")
+            .replace("#define HAVE_VERBS_DL 1", "#define HAVE_VERBS_DL 0")
+            .replace("#define HAVE_COLL_DL 1", "#define HAVE_COLL_DL 0")
+            .replace("#define HAVE_HOOK_HMEM_DL 1", "#define HAVE_HOOK_HMEM_DL 0")
+            .replace("#define HAVE_TRACE_DL 1", "#define HAVE_TRACE_DL 0")
+            .replace("#define HAVE_OPX_DL 1", "#define HAVE_OPX_DL 0")
+            .replace("#define HAVE_USNIC_DL 1", "#define HAVE_USNIC_DL 0")
+            .replace("#define HAVE_PSM3_DL 1", "#define HAVE_PSM3_DL 0");
+        std::fs::write(&config_h, patched).ok();
+        println!("cargo:warning=Patched config.h: disabled SYMVER + forced all providers builtin");
+    }
+
+    // Build and install
+    println!("cargo:warning=Building libfabric...");
+    let nproc = std::process::Command::new("nproc").output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(4);
+    run_cmd(std::process::Command::new("make").args(["-j", &nproc.to_string()]).current_dir(&build_dir)).ok()?;
+    run_cmd(std::process::Command::new("make").arg("install").current_dir(&build_dir)).ok()?;
+    println!("cargo:warning=libfabric build complete");
+
+    Path::new(&lib_a).exists().then(|| {
+        (format!("{}/include", install), format!("{}/lib", install))
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn main() {}
 
@@ -57,6 +162,7 @@ fn main() {
 
     // Create the absolute path to the header file
     let header_path = format!("{}/src/rdmaxcel.h", manifest_dir);
+    let efa_header_path = format!("{}/src/rdmaxcel_efa.h", manifest_dir);
 
     // Check if the header file exists
     if !Path::new(&header_path).exists() {
@@ -67,6 +173,7 @@ fn main() {
     let mut builder = bindgen::Builder::default()
         // The input header we would like to generate bindings for
         .header(&header_path)
+        .header(&efa_header_path)
         .clang_arg("-x")
         .clang_arg("c++")
         .clang_arg("-std=c++14")
@@ -98,6 +205,8 @@ fn main() {
         .allowlist_function("rdmaxcel_register_segment_scanner")
         .allowlist_function("poll_cq_with_cache")
         .allowlist_function("completion_cache_.*")
+        // EFA functions
+        .allowlist_function("rdmaxcel_efa_.*")
         .allowlist_type("ibv_.*")
         .allowlist_type("mlx5dv_.*")
         .allowlist_type("mlx5_wqe_.*")
@@ -113,8 +222,13 @@ fn main() {
         .allowlist_type("poll_context_t")
         .allowlist_type("poll_context")
         .allowlist_type("rdmaxcel_segment_scanner_fn")
+        // EFA types
+        .allowlist_type("efa_error_code_t")
+        .allowlist_type("rdmaxcel_efa_ep_t")
+        .allowlist_type("rdmaxcel_efa_ep")
         .allowlist_var("MLX5_.*")
         .allowlist_var("IBV_.*")
+        .allowlist_var("EFA_.*")
         // Block specific types that are manually defined in lib.rs
         .blocklist_type("ibv_wc")
         .blocklist_type("mlx5_wqe_ctrl_seg")
@@ -237,6 +351,72 @@ fn main() {
 
                 // Statically link libstdc++ to avoid runtime dependency on system libstdc++
                 build_utils::link_libstdcpp_static();
+
+                // Compile EFA support with libfabric built from source
+                let efa_cpp_path = format!("{}/src/rdmaxcel_efa.cpp", manifest_dir);
+                if Path::new(&efa_cpp_path).exists() {
+                    println!("cargo:rerun-if-env-changed=MONARCH_LIBFABRIC_TAG");
+                    println!("cargo:rerun-if-changed={}", efa_cpp_path);
+                    println!(
+                        "cargo:rerun-if-changed={}/src/rdmaxcel_efa.h",
+                        manifest_dir
+                    );
+
+                    // Build or locate libfabric
+                    let libfabric_result = build_libfabric();
+
+                    if let Some((libfabric_include, libfabric_lib_dir)) = libfabric_result {
+                        // Compile rdmaxcel_efa.cpp with HAVE_LIBFABRIC
+                        let mut efa_build = cc::Build::new();
+                        efa_build
+                            .file(&efa_cpp_path)
+                            .include(format!("{}/src", manifest_dir))
+                            .include(&libfabric_include)
+                            .define("HAVE_LIBFABRIC", "1")
+                            .flag("-fPIC")
+                            .cpp(true)
+                            .flag("-std=c++14");
+
+                        efa_build.compile("rdmaxcel_efa");
+
+                        // Export libfabric path via metadata so the final
+                        // cdylib crate (monarch_extension) can link it.
+                        // cargo:rustc-link-arg from a lib crate does NOT
+                        // propagate to the cdylib link step.
+                        let libfabric_a = format!("{}/libfabric.a", libfabric_lib_dir);
+                        println!("cargo:metadata=LIBFABRIC_A={}", libfabric_a);
+
+                        // Link libfabric's private dependencies
+                        // (ibverbs + efa are already linked by monarch_cpp_static_libs)
+                        // (rt, pthread, dl are already linked earlier for cudart_static)
+                        println!("cargo:rustc-link-lib=numa");
+                        println!("cargo:rustc-link-lib=uuid");
+                        println!("cargo:rustc-link-lib=hwloc");
+                        println!("cargo:rustc-link-lib=rdmacm");
+                        println!("cargo:rustc-link-lib=nl-3");
+                        println!("cargo:rustc-link-lib=nl-route-3");
+                        println!("cargo:rustc-link-lib=atomic");
+
+                        println!("cargo:rustc-cfg=feature=\"efa\"");
+                        println!("cargo:rustc-check-cfg=cfg(feature, values(\"efa\"))");
+
+                        println!(
+                            "cargo:warning=Statically linked libfabric from {}",
+                            libfabric_lib_dir
+                        );
+                    } else {
+                        // libfabric not available — compile stubs
+                        let mut efa_build = cc::Build::new();
+                        efa_build
+                            .file(&efa_cpp_path)
+                            .include(format!("{}/src", manifest_dir))
+                            .flag("-fPIC")
+                            .cpp(true)
+                            .flag("-std=c++14");
+
+                        efa_build.compile("rdmaxcel_efa");
+                    }
+                }
             } else {
                 if !Path::new(&cpp_source_path).exists() {
                     panic!("C++ source file not found at {}", cpp_source_path);
