@@ -32,6 +32,20 @@ from monarch._src.actor.proc_mesh import get_or_spawn_controller
 from pyre_extensions import none_throws
 
 
+# RDMARead/WriteTransferWarnings are warnings that are only printed once per process.
+# Remove these once GPU support is added.
+class RDMAReadTransferWarning(Warning):
+    pass
+
+
+class RDMAWriteTransferWarning(Warning):
+    pass
+
+
+warnings.simplefilter("once", RDMAReadTransferWarning)
+warnings.simplefilter("once", RDMAWriteTransferWarning)
+
+
 def is_rdma_available():
     return _RdmaBuffer.rdma_supported()
 
@@ -79,6 +93,7 @@ else:
 
 # Cached so that we don't have to call out to the root client every time,
 # which may be on a different host.
+@functools.cache
 def _ensure_init_rdma_manager() -> Shared[None]:
     """Initialize the RDMA manager for this node's backend (ibverbs or EFA)."""
     async def task() -> None:

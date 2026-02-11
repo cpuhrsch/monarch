@@ -16,6 +16,8 @@ from monarch._src.rdma.rdma import (
     is_rdma_available,
     RDMAAction,
     RDMABuffer,
+    RDMAReadTransferWarning,
+    RDMAWriteTransferWarning,
 )
 
 __all__ = [
@@ -24,4 +26,6 @@ __all__ = [
     "is_rdma_available",
     "RDMABuffer",
     "RDMAAction",
+    "RDMAReadTransferWarning",
+    "RDMAWriteTransferWarning",
 ]
