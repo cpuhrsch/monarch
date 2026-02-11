@@ -381,11 +381,10 @@ class RDMABuffer:
 
         local_proc_id = context().actor_instance.proc_id
         client = context().actor_instance
-        buffer = self._buffer
 
         async def read_into_nonblocking() -> Optional[int]:
             await _ensure_init_manager()
-            return await buffer.read_into(
+            return await self._buffer.read_into(
                 addr=dst_addr,
                 size=dst_size,
                 local_proc_id=local_proc_id,
@@ -430,11 +429,10 @@ class RDMABuffer:
 
         local_proc_id = context().actor_instance.proc_id
         client = context().actor_instance
-        buffer = self._buffer
 
         async def write_from_nonblocking() -> None:
             await _ensure_init_manager()
-            return await buffer.write_from(
+            return await self._buffer.write_from(
                 addr=src_addr,
                 size=src_size,
                 local_proc_id=local_proc_id,
@@ -450,11 +448,10 @@ class RDMABuffer:
         """
         local_proc_id = context().actor_instance.proc_id
         client = context().actor_instance
-        buffer = self._buffer
 
         async def drop_nonblocking() -> None:
             await _ensure_init_manager()
-            await buffer.drop(
+            await self._buffer.drop(
                 local_proc_id=local_proc_id,
                 client=client,
             )
@@ -484,6 +481,8 @@ class RDMAAction:
 
         READ_INTO = "read_into"
         WRITE_FROM = "write_from"
+        FETCH_ADD = "fetch_add"
+        COMPARE_AND_SWAP = "compare_and_swap"
 
     def __init__(self) -> None:
         self._instructs: List[Tuple[RDMAAction.RDMAOp, RDMABuffer, LocalMemory]] = []
@@ -592,6 +591,45 @@ class RDMAAction:
         self._instructs.append((self.RDMAOp.WRITE_FROM, src, dst))
 
         return self
+
+    def fetch_add(self, src: RDMABuffer, dst: LocalMemory, add: int) -> Self:
+        """
+        Perform atomic fetch-and-add operation on src RDMA buffer.
+
+        Args:
+            src: src RDMA buffer to perform operation on
+            dst: Local memory to store the original value
+            add: Value to add to the src buffer
+
+        Atomically:
+            *dst = *src
+            *src = *src + add
+
+        Note: src/dst are 8 bytes
+        """
+        raise NotImplementedError("Not yet supported")
+
+    def compare_and_swap(
+        self, src: RDMABuffer, dst: LocalMemory, compare: int, swap: int
+    ) -> Self:
+        """
+        Perform atomic compare-and-swap operation on src RDMA buffer.
+
+        Args:
+            src: src RDMA buffer to perform operation on
+            dst: Local memory to store the original value
+            compare: Value to compare against
+            swap: Value to swap in if comparison succeeds
+
+        Atomically:
+            *dst = *src;
+            if (*src == compare) {
+                *src = swap
+            }
+
+        Note: src/dst are 8 bytes
+        """
+        raise NotImplementedError("Not yet supported")
 
     def submit(self) -> Future[None]:
         """
