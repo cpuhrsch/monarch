@@ -13,6 +13,15 @@
 #include <cstring>
 #include <ctime>
 #include <new>
+#include <unordered_map>
+
+#include <rdma/fabric.h>
+#include <rdma/fi_cm.h>
+#include <rdma/fi_domain.h>
+#include <rdma/fi_endpoint.h>
+#include <rdma/fi_errno.h>
+#include <rdma/fi_rma.h>
+#include <rdma/fi_tagged.h>
 
 // Debug macro - only prints when MONARCH_DEBUG_EFA=1
 static inline bool efa_debug_enabled() {
@@ -24,17 +33,6 @@ static inline bool efa_debug_enabled() {
   return enabled == 1;
 }
 #define EFA_DEBUG(...) do { if (efa_debug_enabled()) fprintf(stderr, __VA_ARGS__); } while(0)
-
-#ifdef HAVE_LIBFABRIC
-#include <unordered_map>
-
-#include <rdma/fabric.h>
-#include <rdma/fi_cm.h>
-#include <rdma/fi_domain.h>
-#include <rdma/fi_endpoint.h>
-#include <rdma/fi_errno.h>
-#include <rdma/fi_rma.h>
-#include <rdma/fi_tagged.h>
 
 // Info about a registered memory region
 struct mr_info {
@@ -83,20 +81,9 @@ static void init_efa_platform(void) {
   }
 }
 
-#else // !HAVE_LIBFABRIC
-
-// Stub structure when libfabric is not available
-struct rdmaxcel_efa_ep {
-  void* buffer;
-  size_t buffer_size;
-};
-
-#endif // HAVE_LIBFABRIC
-
 extern "C" {
 
 int rdmaxcel_efa_available(void) {
-#ifdef HAVE_LIBFABRIC
   static int cached_result = -1;
 
   if (cached_result >= 0) {
@@ -135,15 +122,11 @@ int rdmaxcel_efa_available(void) {
 
   cached_result = 0;
   return 0;
-#else
-  return 0;
-#endif
 }
 
 rdmaxcel_efa_ep_t* rdmaxcel_efa_ep_create(
     const char* provider,
     size_t buffer_size) {
-#ifdef HAVE_LIBFABRIC
   // Initialize platform settings on first use
   static bool platform_initialized = false;
   if (!platform_initialized) {
@@ -314,11 +297,6 @@ rdmaxcel_efa_ep_t* rdmaxcel_efa_ep_create(
   }
 
   return ep;
-#else
-  (void)provider;
-  (void)buffer_size;
-  return nullptr;
-#endif
 }
 
 void rdmaxcel_efa_ep_destroy(rdmaxcel_efa_ep_t* ep) {
@@ -326,7 +304,6 @@ void rdmaxcel_efa_ep_destroy(rdmaxcel_efa_ep_t* ep) {
     return;
   }
 
-#ifdef HAVE_LIBFABRIC
   // Deregister all MRs
   for (auto& pair : ep->registered_mrs) {
     if (pair.second.mr) {
@@ -354,7 +331,6 @@ void rdmaxcel_efa_ep_destroy(rdmaxcel_efa_ep_t* ep) {
   if (ep->fi) {
     fi_freeinfo(ep->fi);
   }
-#endif
 
   if (ep->buffer) {
     free(ep->buffer);
@@ -366,7 +342,6 @@ int rdmaxcel_efa_get_local_addr(
     rdmaxcel_efa_ep_t* ep,
     void* addr_out,
     size_t* addr_len) {
-#ifdef HAVE_LIBFABRIC
   if (!ep || !addr_out || !addr_len) {
     return EFA_ERROR_INVALID_PARAMS;
   }
@@ -379,12 +354,6 @@ int rdmaxcel_efa_get_local_addr(
   memcpy(addr_out, ep->local_addr, ep->local_addr_len);
   *addr_len = ep->local_addr_len;
   return EFA_SUCCESS;
-#else
-  (void)ep;
-  (void)addr_out;
-  (void)addr_len;
-  return EFA_ERROR_NOT_AVAILABLE;
-#endif
 }
 
 int rdmaxcel_efa_insert_peer_addr(
@@ -392,7 +361,6 @@ int rdmaxcel_efa_insert_peer_addr(
     const void* peer_addr,
     size_t addr_len,
     uint64_t* fi_addr_out) {
-#ifdef HAVE_LIBFABRIC
   if (!ep || !peer_addr || addr_len == 0 || !fi_addr_out) {
     return EFA_ERROR_INVALID_PARAMS;
   }
@@ -407,13 +375,6 @@ int rdmaxcel_efa_insert_peer_addr(
   *fi_addr_out = static_cast<uint64_t>(fi_addr);
   EFA_DEBUG("[EFA] insert_peer_addr: fi_addr=%lu\n", (unsigned long)fi_addr);
   return EFA_SUCCESS;
-#else
-  (void)ep;
-  (void)peer_addr;
-  (void)addr_len;
-  (void)fi_addr_out;
-  return EFA_ERROR_NOT_AVAILABLE;
-#endif
 }
 
 int rdmaxcel_efa_register_mr(
@@ -421,7 +382,6 @@ int rdmaxcel_efa_register_mr(
     void* addr,
     size_t size,
     uint64_t* key_out) {
-#ifdef HAVE_LIBFABRIC
   if (!ep || !addr || size == 0 || !key_out) {
     return EFA_ERROR_INVALID_PARAMS;
   }
@@ -460,17 +420,9 @@ int rdmaxcel_efa_register_mr(
           addr, size, (unsigned long)*key_out, (unsigned long)internal_id, ep->registered_mrs.size());
 
   return EFA_SUCCESS;
-#else
-  (void)ep;
-  (void)addr;
-  (void)size;
-  (void)key_out;
-  return EFA_ERROR_NOT_AVAILABLE;
-#endif
 }
 
 int rdmaxcel_efa_deregister_mr(rdmaxcel_efa_ep_t* ep, uint64_t key) {
-#ifdef HAVE_LIBFABRIC
   if (!ep) {
     return EFA_ERROR_INVALID_PARAMS;
   }
@@ -489,11 +441,6 @@ int rdmaxcel_efa_deregister_mr(rdmaxcel_efa_ep_t* ep, uint64_t key) {
   EFA_DEBUG("[EFA] deregister_mr: key=%lu NOT FOUND in %zu MRs\n",
           (unsigned long)key, ep->registered_mrs.size());
   return EFA_ERROR_INVALID_PARAMS;
-#else
-  (void)ep;
-  (void)key;
-  return EFA_ERROR_NOT_AVAILABLE;
-#endif
 }
 
 int rdmaxcel_efa_write(
@@ -503,7 +450,6 @@ int rdmaxcel_efa_write(
     uint64_t remote_addr,
     uint64_t remote_key,
     uint64_t peer) {
-#ifdef HAVE_LIBFABRIC
   if (!ep || !local_addr || size == 0) {
     return EFA_ERROR_INVALID_PARAMS;
   }
@@ -563,15 +509,6 @@ int rdmaxcel_efa_write(
   }
 
   return EFA_ERROR_WRITE_FAILED;
-#else
-  (void)ep;
-  (void)local_addr;
-  (void)size;
-  (void)remote_addr;
-  (void)remote_key;
-  (void)peer;
-  return EFA_ERROR_NOT_AVAILABLE;
-#endif
 }
 
 int rdmaxcel_efa_read(
@@ -581,7 +518,6 @@ int rdmaxcel_efa_read(
     uint64_t remote_addr,
     uint64_t remote_key,
     uint64_t peer) {
-#ifdef HAVE_LIBFABRIC
   if (!ep || !local_addr || size == 0) {
     EFA_DEBUG("[EFA] read: invalid params (ep=%p, local_addr=%p, size=%zu)\n", ep, local_addr, size);
     return EFA_ERROR_INVALID_PARAMS;
@@ -634,19 +570,9 @@ int rdmaxcel_efa_read(
 
   EFA_DEBUG("[EFA] read: exhausted retries\n");
   return EFA_ERROR_READ_FAILED;
-#else
-  (void)ep;
-  (void)local_addr;
-  (void)size;
-  (void)remote_addr;
-  (void)remote_key;
-  (void)peer;
-  return EFA_ERROR_NOT_AVAILABLE;
-#endif
 }
 
 int rdmaxcel_efa_poll_cq(rdmaxcel_efa_ep_t* ep, int timeout_ms) {
-#ifdef HAVE_LIBFABRIC
   if (!ep) {
     return EFA_ERROR_INVALID_PARAMS;
   }
@@ -709,15 +635,9 @@ int rdmaxcel_efa_poll_cq(rdmaxcel_efa_ep_t* ep, int timeout_ms) {
     fprintf(stderr, "[EFA] poll_cq failed with error: %s (%zd)\n", fi_strerror(-ret), ret);
     return EFA_ERROR_POLL_FAILED;
   }
-#else
-  (void)ep;
-  (void)timeout_ms;
-  return EFA_ERROR_NOT_AVAILABLE;
-#endif
 }
 
 int rdmaxcel_efa_tsend(rdmaxcel_efa_ep_t* ep, uint64_t tag, uint64_t peer) {
-#ifdef HAVE_LIBFABRIC
   if (!ep) {
     return EFA_ERROR_INVALID_PARAMS;
   }
@@ -752,16 +672,9 @@ int rdmaxcel_efa_tsend(rdmaxcel_efa_ep_t* ep, uint64_t tag, uint64_t peer) {
   }
 
   return EFA_ERROR_WRITE_FAILED;
-#else
-  (void)ep;
-  (void)tag;
-  (void)peer;
-  return EFA_ERROR_NOT_AVAILABLE;
-#endif
 }
 
 int rdmaxcel_efa_trecv(rdmaxcel_efa_ep_t* ep, uint64_t tag) {
-#ifdef HAVE_LIBFABRIC
   if (!ep) {
     return EFA_ERROR_INVALID_PARAMS;
   }
@@ -797,11 +710,6 @@ int rdmaxcel_efa_trecv(rdmaxcel_efa_ep_t* ep, uint64_t tag) {
   }
 
   return EFA_ERROR_READ_FAILED;
-#else
-  (void)ep;
-  (void)tag;
-  return EFA_ERROR_NOT_AVAILABLE;
-#endif
 }
 
 const char* rdmaxcel_efa_error_string(int error_code) {

@@ -363,21 +363,20 @@ fn main() {
                     );
 
                     // Build or locate libfabric
-                    let libfabric_result = build_libfabric();
+                    let (libfabric_include, libfabric_lib_dir) = build_libfabric()
+                        .expect("Failed to build libfabric. EFA support requires libfabric.");
 
-                    if let Some((libfabric_include, libfabric_lib_dir)) = libfabric_result {
-                        // Compile rdmaxcel_efa.cpp with HAVE_LIBFABRIC
-                        let mut efa_build = cc::Build::new();
-                        efa_build
-                            .file(&efa_cpp_path)
-                            .include(format!("{}/src", manifest_dir))
-                            .include(&libfabric_include)
-                            .define("HAVE_LIBFABRIC", "1")
-                            .flag("-fPIC")
-                            .cpp(true)
-                            .flag("-std=c++14");
+                    // Compile rdmaxcel_efa.cpp
+                    let mut efa_build = cc::Build::new();
+                    efa_build
+                        .file(&efa_cpp_path)
+                        .include(format!("{}/src", manifest_dir))
+                        .include(&libfabric_include)
+                        .flag("-fPIC")
+                        .cpp(true)
+                        .flag("-std=c++14");
 
-                        efa_build.compile("rdmaxcel_efa");
+                    efa_build.compile("rdmaxcel_efa");
 
                         // Export libfabric path via metadata so the final
                         // cdylib crate (monarch_extension) can link it.
@@ -404,18 +403,6 @@ fn main() {
                             "cargo:warning=Statically linked libfabric from {}",
                             libfabric_lib_dir
                         );
-                    } else {
-                        // libfabric not available — compile stubs
-                        let mut efa_build = cc::Build::new();
-                        efa_build
-                            .file(&efa_cpp_path)
-                            .include(format!("{}/src", manifest_dir))
-                            .flag("-fPIC")
-                            .cpp(true)
-                            .flag("-std=c++14");
-
-                        efa_build.compile("rdmaxcel_efa");
-                    }
                 }
             } else {
                 if !Path::new(&cpp_source_path).exists() {
