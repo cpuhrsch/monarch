@@ -37,6 +37,3 @@ docs/**/generated/**
 */sg_execution_times.rst
 
 .venv/**
-
-# Claude Code local settings
-.claude/

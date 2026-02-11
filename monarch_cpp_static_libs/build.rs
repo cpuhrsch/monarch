@@ -19,7 +19,7 @@ use std::process::Command;
 
 // Repository configuration
 const RDMA_CORE_REPO: &str = "https://github.com/linux-rdma/rdma-core";
-const RDMA_CORE_TAG: &str = "v54.0";
+const RDMA_CORE_TAG: &str = "224154663a9ad5b1ad5629fb76a0c40c675fb936";
 
 #[cfg(not(target_os = "linux"))]
 fn main() {}
