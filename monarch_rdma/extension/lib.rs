@@ -606,7 +606,7 @@ impl PyEfaManager {
     /// Creates an EFA manager actor on the given ProcMesh (async version).
     /// Returns the actor mesh if EFA is supported, None otherwise.
     #[classmethod]
-    fn create_efa_manager_nonblocking(
+    fn create_rdma_manager_nonblocking(
         _cls: &Bound<'_, PyType>,
         proc_mesh: &Bound<'_, PyAny>,
         client: PyInstance,

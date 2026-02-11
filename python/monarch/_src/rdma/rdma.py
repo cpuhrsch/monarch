@@ -76,12 +76,14 @@ def get_rdma_backend() -> str:
     return "none"
 
 
-# Alias the buffer class based on backend so RDMABuffer.__init__ needs no branching.
-# Both _RdmaBuffer and _EfaActorBuffer have the same interface.
+# Alias the buffer and manager classes based on backend so the rest of the
+# code needs no branching. Both backends expose the same interface.
 if is_efa_available():
     from monarch._rust_bindings.rdma import _EfaActorBuffer as _BackendBuffer
+    from monarch._rust_bindings.rdma import _EfaManager as _BackendManager
 else:
     _BackendBuffer = _RdmaBuffer
+    _BackendManager = _RdmaManager
 
 
 # Cached so that we don't have to call out to the root client every time,
@@ -163,21 +165,11 @@ class RdmaController(Actor):
                 proc_mesh_result = await Future(
                     coro=cast("PythonTask[Any]", proc_mesh._proc_mesh.task())
                 )
-                backend = get_rdma_backend()
-                if backend == "efa":
-                    from monarch._rust_bindings.rdma import _EfaManager
-
-                    return none_throws(
-                        await _EfaManager.create_efa_manager_nonblocking(
-                            proc_mesh_result, context().actor_instance
-                        )
+                return none_throws(
+                    await _BackendManager.create_rdma_manager_nonblocking(
+                        proc_mesh_result, context().actor_instance
                     )
-                else:
-                    return none_throws(
-                        await _RdmaManager.create_rdma_manager_nonblocking(
-                            proc_mesh_result, context().actor_instance
-                        )
-                    )
+                )
 
             self._manager_futures[proc_mesh] = Future(coro=create_manager())
 
