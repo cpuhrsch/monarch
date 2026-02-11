@@ -8,7 +8,6 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 use std::ops::Deref;
-
 use hyperactor::ActorId;
 use hyperactor::ActorRef;
 use hyperactor::ProcId;
@@ -19,9 +18,13 @@ use monarch_hyperactor::proc_mesh::PyProcMesh;
 use monarch_hyperactor::pytokio::PyPythonTask;
 use monarch_hyperactor::runtime::monarch_with_gil_blocking;
 use monarch_hyperactor::runtime::signal_safe_block_on;
+use monarch_rdma::EfaBuffer;
+use monarch_rdma::EfaManagerActor;
 use monarch_rdma::RdmaBuffer;
 use monarch_rdma::RdmaManagerActor;
 use monarch_rdma::RdmaManagerMessageClient;
+use monarch_rdma::efa_manager_actor::EfaManagerMessageClient;
+use monarch_rdma::efa_supported;
 use monarch_rdma::rdma_supported;
 use monarch_rdma::register_segment_scanner;
 use pyo3::IntoPyObjectExt;
@@ -113,7 +116,7 @@ unsafe extern "C" fn pytorch_segment_scanner(
         Ok(count) => count,
         Err(e) => {
             // Log the specific error for debugging
-            eprintln!("[monarch_rdma] pytorch_segment_scanner failed: {}", e);
+            tracing::warn!("[monarch_rdma] pytorch_segment_scanner failed: {}", e);
             0
         }
     }
@@ -199,6 +202,11 @@ impl PyRdmaBuffer {
     #[classmethod]
     fn rdma_supported<'py>(_cls: &Bound<'_, PyType>, _py: Python<'py>) -> bool {
         rdma_supported()
+    }
+
+    #[classmethod]
+    fn efa_supported<'py>(_cls: &Bound<'_, PyType>, _py: Python<'py>) -> bool {
+        efa_supported()
     }
 
     #[pyo3(name = "__repr__")]
@@ -374,6 +382,254 @@ impl PyRdmaManager {
     }
 }
 
+// ============================================================================
+// Actor-based EFA Buffer (picklable, uses EfaManagerActor)
+// ============================================================================
+
+fn setup_efa_context(
+    efa_buffer: &PyEfaActorBuffer,
+    local_proc_id: String,
+) -> (ActorRef<EfaManagerActor>, EfaBuffer) {
+    let proc_id: ProcId = local_proc_id.parse().unwrap();
+    // TODO: find some better way to look this up, or else formally define "service names"
+    let local_owner_id = ActorId(proc_id, "efa_manager".to_string(), 0);
+    let local_owner_ref: ActorRef<EfaManagerActor> = ActorRef::attest(local_owner_id);
+    let buffer = efa_buffer.buffer.clone();
+    (local_owner_ref, buffer)
+}
+
+/// Actor-based EFA buffer that supports pickling.
+///
+/// This class wraps an EfaBuffer (from efa_components.rs) and uses EfaManagerActor
+/// for coordination, similar to how PyRdmaBuffer uses RdmaManagerActor.
+#[pyclass(name = "_EfaActorBuffer", module = "monarch._rust_bindings.rdma")]
+#[derive(Clone, Serialize, Deserialize, Named)]
+struct PyEfaActorBuffer {
+    buffer: EfaBuffer,
+    owner_ref: ActorRef<EfaManagerActor>,
+}
+
+async fn create_efa_buffer(
+    addr: usize,
+    size: usize,
+    proc_id: ProcId,
+    client: PyInstance,
+) -> PyResult<PyEfaActorBuffer> {
+    // Get the owning EfaManagerActor's ActorRef
+    // TODO: find some better way to look this up, or else formally define "service names"
+    let owner_id = ActorId(proc_id, "efa_manager".to_string(), 0);
+    let owner_ref: ActorRef<EfaManagerActor> = ActorRef::attest(owner_id);
+
+    // Create the EfaBuffer
+    let buffer = owner_ref
+        .request_buffer(client.deref(), addr, size)
+        .await?;
+    Ok(PyEfaActorBuffer { buffer, owner_ref })
+}
+
+#[pymethods]
+impl PyEfaActorBuffer {
+    #[classmethod]
+    fn create_efa_buffer_nonblocking<'py>(
+        _cls: &Bound<'_, PyType>,
+        _py: Python<'py>,
+        addr: usize,
+        size: usize,
+        proc_id: String,
+        client: PyInstance,
+    ) -> PyResult<PyPythonTask> {
+        if !efa_supported() {
+            return Err(PyException::new_err("EFA is not supported on this system"));
+        }
+        PyPythonTask::new(create_efa_buffer(
+            addr,
+            size,
+            proc_id.parse().unwrap(),
+            client,
+        ))
+    }
+
+    #[classmethod]
+    fn create_efa_buffer_blocking<'py>(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'py>,
+        addr: usize,
+        size: usize,
+        proc_id: String,
+        client: PyInstance,
+    ) -> PyResult<PyEfaActorBuffer> {
+        if !efa_supported() {
+            return Err(PyException::new_err("EFA is not supported on this system"));
+        }
+        signal_safe_block_on(
+            py,
+            create_efa_buffer(addr, size, proc_id.parse().unwrap(), client),
+        )?
+    }
+
+    #[classmethod]
+    fn efa_supported<'py>(_cls: &Bound<'_, PyType>, _py: Python<'py>) -> bool {
+        efa_supported()
+    }
+
+    #[pyo3(name = "__repr__")]
+    fn repr(&self) -> String {
+        format!("<EfaActorBuffer'{:?}'>", self.buffer)
+    }
+
+    /// Reads data from the local buffer and places it into this remote EFA buffer.
+    ///
+    /// # Arguments
+    /// * `addr` - The address of the local buffer to read from
+    /// * `size` - The size of the data to transfer
+    /// * `local_proc_id` - The process ID where the local buffer resides
+    /// * `client` - The actor who does the reading
+    /// * `timeout` - Maximum time in seconds to wait for the operation
+    #[pyo3(signature = (addr, size, local_proc_id, client, timeout))]
+    fn read_into<'py>(
+        &self,
+        _py: Python<'py>,
+        addr: usize,
+        size: usize,
+        local_proc_id: String,
+        client: PyInstance,
+        timeout: u64,
+    ) -> PyResult<PyPythonTask> {
+        let (local_owner_ref, buffer) = setup_efa_context(self, local_proc_id);
+        PyPythonTask::new(async move {
+            let local_buffer = local_owner_ref
+                .request_buffer(client.deref(), addr, size)
+                .await
+                .map_err(|e| PyException::new_err(format!("failed to request EFA buffer: {}", e)))?;
+            local_buffer
+                .write_from(client.deref(), buffer, timeout)
+                .await
+                .map_err(|e| PyException::new_err(format!("failed to read into buffer: {}", e)))?;
+            // Don't release — MRs are cached and reused across transfers.
+            // Cleanup happens when the EfaManagerActor is dropped.
+            Ok(())
+        })
+    }
+
+    /// Writes data from this remote EFA buffer into a local buffer.
+    ///
+    /// # Arguments
+    /// * `addr` - The address of the local buffer to write to
+    /// * `size` - The size of the data to transfer
+    /// * `local_proc_id` - The process ID where the local buffer resides
+    /// * `client` - The actor who does the writing
+    /// * `timeout` - Maximum time in seconds to wait for the operation
+    #[pyo3(signature = (addr, size, local_proc_id, client, timeout))]
+    fn write_from<'py>(
+        &self,
+        _py: Python<'py>,
+        addr: usize,
+        size: usize,
+        local_proc_id: String,
+        client: PyInstance,
+        timeout: u64,
+    ) -> PyResult<PyPythonTask> {
+        let (local_owner_ref, buffer) = setup_efa_context(self, local_proc_id);
+        PyPythonTask::new(async move {
+            let local_buffer = local_owner_ref
+                .request_buffer(client.deref(), addr, size)
+                .await
+                .map_err(|e| PyException::new_err(format!("failed to request EFA buffer: {}", e)))?;
+            // buffer = remote dest, local_buffer = local source
+            // write_from(source) pushes data from source to dest
+            buffer
+                .write_from(client.deref(), local_buffer, timeout)
+                .await
+                .map_err(|e| PyException::new_err(format!("failed to write from buffer: {}", e)))?;
+            Ok(())
+        })
+    }
+
+    fn size(&self) -> usize {
+        self.buffer.size()
+    }
+
+    fn __reduce__(&self) -> PyResult<(PyObject, PyObject)> {
+        Python::with_gil(|py| {
+            let ctor = py.get_type::<PyEfaActorBuffer>().into_py_any(py)?;
+            let json = serde_json::to_string(self).map_err(|e| {
+                PyErr::new::<PyValueError, _>(format!("Serialization failed: {}", e))
+            })?;
+
+            let args = PyTuple::new(py, [json])?.into_py_any(py)?;
+            Ok((ctor, args))
+        })
+    }
+
+    #[new]
+    fn new_from_json(json: &str) -> PyResult<Self> {
+        let deserialized: PyEfaActorBuffer = serde_json::from_str(json)
+            .map_err(|e| PyErr::new::<PyValueError, _>(format!("Deserialization failed: {}", e)))?;
+        Ok(deserialized)
+    }
+
+    fn drop<'py>(
+        &self,
+        _py: Python<'py>,
+        local_proc_id: String,
+        client: PyInstance,
+    ) -> PyResult<PyPythonTask> {
+        let (_local_owner_ref, buffer) = setup_efa_context(self, local_proc_id);
+        PyPythonTask::new(async move {
+            buffer
+                .drop_buffer(client.deref())
+                .await
+                .map_err(|e| PyException::new_err(format!("Failed to drop buffer: {}", e)))?;
+            Ok(())
+        })
+    }
+
+    fn owner_actor_id(&self) -> String {
+        self.owner_ref.actor_id().to_string()
+    }
+}
+
+/// Python wrapper for the EFA Manager actor mesh.
+#[pyclass(name = "_EfaManager", module = "monarch._rust_bindings.rdma")]
+pub struct PyEfaManager {
+    #[allow(dead_code)] // field never read
+    inner: SharedCell<RootActorMesh<'static, EfaManagerActor>>,
+}
+
+#[pymethods]
+impl PyEfaManager {
+    #[pyo3(name = "__repr__")]
+    fn repr(&self) -> String {
+        "<EfaManager>".to_string()
+    }
+
+    /// Creates an EFA manager actor on the given ProcMesh (async version).
+    /// Returns the actor mesh if EFA is supported, None otherwise.
+    #[classmethod]
+    fn create_efa_manager_nonblocking(
+        _cls: &Bound<'_, PyType>,
+        proc_mesh: &Bound<'_, PyAny>,
+        client: PyInstance,
+    ) -> PyResult<PyPythonTask> {
+        tracing::debug!("spawning EFA manager on target proc_mesh nodes");
+
+        let proc_mesh = proc_mesh.downcast::<PyProcMesh>()?.borrow().mesh_ref()?;
+        PyPythonTask::new(async move {
+            let actor_mesh: hyperactor_mesh::v1::ActorMesh<EfaManagerActor> = proc_mesh
+                .spawn_service(client.deref(), "efa_manager", &())
+                .await
+                .map_err(|err| PyException::new_err(err.to_string()))?;
+
+            let actor_mesh = RootActorMesh::from(actor_mesh);
+            let actor_mesh = SharedCell::from(actor_mesh);
+
+            Ok(Some(PyEfaManager {
+                inner: actor_mesh,
+            }))
+        })
+    }
+}
+
 pub fn register_python_bindings(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register the PyTorch segment scanner callback.
     // This calls torch.cuda.memory._snapshot() to get CUDA memory segments.
@@ -381,5 +637,7 @@ pub fn register_python_bindings(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
     module.add_class::<PyRdmaBuffer>()?;
     module.add_class::<PyRdmaManager>()?;
+    module.add_class::<PyEfaActorBuffer>()?;
+    module.add_class::<PyEfaManager>()?;
     Ok(())
 }

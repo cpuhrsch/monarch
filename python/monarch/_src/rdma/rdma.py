@@ -32,38 +32,73 @@ from monarch._src.actor.proc_mesh import get_or_spawn_controller
 from pyre_extensions import none_throws
 
 
-# RDMARead/WriteTransferWarnings are warnings that are only printed once per process.
-# Remove these once GPU support is added.
-class RDMAReadTransferWarning(Warning):
-    pass
-
-
-class RDMAWriteTransferWarning(Warning):
-    pass
-
-
-warnings.simplefilter("once", RDMAReadTransferWarning)
-warnings.simplefilter("once", RDMAWriteTransferWarning)
-
-
 def is_rdma_available():
     return _RdmaBuffer.rdma_supported()
 
 
+def is_efa_available() -> bool:
+    """Check if EFA backend is available.
+
+    Returns:
+        bool: True if EFA/libfabric backend is available, False otherwise.
+    """
+    try:
+        return _RdmaBuffer.efa_supported()
+    except AttributeError:
+        # Method not available, EFA not compiled in
+        return False
+
+
+def get_rdma_backend() -> str:
+    """Return available RDMA backend.
+
+    Returns:
+        str: One of 'ibverbs', 'efa', or 'none' indicating the available backend.
+             EFA is preferred when available since ibverbs may detect EFA devices
+             but cannot create queue pairs on them.
+    """
+    if is_efa_available():
+        return "efa"
+
+    try:
+        if _RdmaBuffer.rdma_supported():
+            return "ibverbs"
+    except Exception:
+        pass
+
+    return "none"
+
+
 # Cached so that we don't have to call out to the root client every time,
 # which may be on a different host.
-@functools.cache
-def _ensure_init_rdma_manager() -> Shared[None]:
-    async def task() -> None:
-        # Ensure the proc mesh is initialized before we can send it over the wire,
-        # since pickling the proc mesh before it is initiliazed would block the
-        # tokio runtime and cause a panic.
-        await context().actor_instance.proc_mesh.initialized
-        await (
-            await get_or_spawn_controller("rdma_controller", RdmaController)
-        ).init_rdma_on_mesh.call_one(none_throws(context().actor_instance.proc_mesh))
+_manager_initialized = False
 
-    return PythonTask.from_coroutine(task()).spawn()
+
+@functools.cache
+def _ensure_init_manager() -> Shared[None]:
+    """Initialize the RDMA manager for this node's backend (ibverbs or EFA)."""
+    backend = get_rdma_backend()
+
+    if backend == "efa":
+        async def task() -> None:
+            global _manager_initialized
+            await context().actor_instance.proc_mesh.initialized
+            await (
+                await get_or_spawn_controller("efa_controller", EfaController)
+            ).init_efa_on_mesh.call_one(none_throws(context().actor_instance.proc_mesh))
+            _manager_initialized = True
+
+        return PythonTask.from_coroutine(task()).spawn()
+    else:
+        async def task() -> None:
+            global _manager_initialized
+            await context().actor_instance.proc_mesh.initialized
+            await (
+                await get_or_spawn_controller("rdma_controller", RdmaController)
+            ).init_rdma_on_mesh.call_one(none_throws(context().actor_instance.proc_mesh))
+            _manager_initialized = True
+
+        return PythonTask.from_coroutine(task()).spawn()
 
 
 def _get_error(buf) -> ValueError:
@@ -145,6 +180,51 @@ class RdmaController(Actor):
         await self._manager_futures[proc_mesh]
 
 
+class EfaController(Actor):
+    """Controller for EFA manager actors, similar to RdmaController for ibverbs."""
+
+    def __init__(self) -> None:
+        self._manager_futures: Dict[ProcMesh, Future[Any]] = {}
+
+    @endpoint
+    async def init_efa_on_mesh(self, proc_mesh: ProcMesh) -> None:
+        from monarch._rust_bindings.rdma import _EfaManager
+
+        if proc_mesh not in self._manager_futures:
+
+            async def create_manager() -> Any:
+                proc_mesh_result = await Future(
+                    coro=cast("PythonTask[Any]", proc_mesh._proc_mesh.task())
+                )
+                return none_throws(
+                    await _EfaManager.create_efa_manager_nonblocking(
+                        proc_mesh_result, context().actor_instance
+                    )
+                )
+
+            self._manager_futures[proc_mesh] = Future(coro=create_manager())
+
+        await self._manager_futures[proc_mesh]
+
+
+def _create_buffer_blocking(addr: int, size: int) -> Any:
+    """Create the appropriate backend buffer for this node."""
+    backend = get_rdma_backend()
+    ctx = context()
+    if backend == "efa":
+        from monarch._rust_bindings.rdma import _EfaActorBuffer
+
+        return _EfaActorBuffer.create_efa_buffer_blocking(
+            addr=addr, size=size,
+            proc_id=ctx.actor_instance.proc_id, client=ctx.actor_instance,
+        )
+    else:
+        return _RdmaBuffer.create_rdma_buffer_blocking(
+            addr=addr, size=size,
+            proc_id=ctx.actor_instance.proc_id, client=ctx.actor_instance,
+        )
+
+
 def pt_cuda_allocator_compatibility() -> bool:
     """
     Check if PyTorch CUDA caching allocator is compatible with RDMA.
@@ -208,6 +288,13 @@ def _check_cuda_expandable_segments_enabled() -> bool:
 
 
 class RDMABuffer:
+    """
+    RDMABuffer supports RDMA operations on 1d contiguous tensors or memoryviews.
+
+    Automatically uses whichever RDMA backend is available on this node
+    (ibverbs or EFA — never both).
+    """
+
     def __init__(
         self,
         data: torch.Tensor | memoryview,
@@ -217,11 +304,10 @@ class RDMABuffer:
 
         Args:
             data: torch.Tensor or memoryview to create the buffer from. Must be 1d and contiguous.
-                  If provided, addr and size must not be specified.
 
         Raises:
             ValueError: If data is not 1d contiguous, if size is 0, or if data is a GPU tensor.
-            RuntimeError: If RDMA is not available on this platform.
+            RuntimeError: If no RDMA backend is available on this platform.
 
         Note:
             Currently only CPU tensors are supported. GPU tensor support will be added in the future.
@@ -229,33 +315,35 @@ class RDMABuffer:
         TODO: Create TensorBuffer, which will be main user API supporting non-contiguous tensors
         """
         if isinstance(data, torch.Tensor) and data.device.type == "cuda":
-            # Check if CUDA caching allocator is using expandable segments
             _check_cuda_expandable_segments_enabled()
 
-        assert is_rdma_available(), (
-            "Tried to create an RDMABuffer, but RDMA is not available on this platform."
-        )
-
-        # We need to ensure that _RdmaManager is initialized at this point, because under the hood
-        # _RdmaBuffer.create_rdma_buffer_blocking relies on this being the case.
-        _ensure_init_rdma_manager().block_on()
+        self._data = data
 
         addr, size = _get_addr_and_size(data)
 
-        try:
-            if size == 0:
-                raise ValueError("Cannot create RDMABuffer with size 0.")
-            ctx = context()
-            self._buffer: _RdmaBuffer = _RdmaBuffer.create_rdma_buffer_blocking(
-                addr=addr,
-                size=size,
-                proc_id=ctx.actor_instance.proc_id,
-                client=ctx.actor_instance,
+        if size == 0:
+            raise ValueError("Cannot create RDMABuffer with size 0.")
+
+        if get_rdma_backend() == "none":
+            raise RuntimeError(
+                "Tried to create an RDMABuffer, but no RDMA backend is available on this platform."
             )
-        # TODO - specific exception
+
+        # block_on is a no-op if already completed (functools.cache returns same Shared).
+        # Skip if already initialized to avoid tokio deadlock when called from actor endpoints.
+        if not _manager_initialized:
+            _ensure_init_manager().block_on()
+
+        try:
+            self._buffer = _create_buffer_blocking(addr, size)
         except Exception as e:
-            logging.error("Failed to create buffer %s", e)
+            logging.error("Failed to create RDMA buffer %s", e)
             raise e
+
+    @property
+    def backend(self) -> str:
+        """Return the RDMA backend in use ('ibverbs' or 'efa')."""
+        return get_rdma_backend()
 
     def size(self) -> int:
         return self._buffer.size()
@@ -293,18 +381,17 @@ class RDMABuffer:
 
         local_proc_id = context().actor_instance.proc_id
         client = context().actor_instance
+        buffer = self._buffer
 
         async def read_into_nonblocking() -> Optional[int]:
-            await _ensure_init_rdma_manager()
-
-            res = await self._buffer.read_into(
+            await _ensure_init_manager()
+            return await buffer.read_into(
                 addr=dst_addr,
                 size=dst_size,
                 local_proc_id=local_proc_id,
                 client=client,
                 timeout=timeout,
             )
-            return res
 
         return Future(coro=read_into_nonblocking())
 
@@ -320,7 +407,6 @@ class RDMABuffer:
         Args:
             src: Source tensor containing data to be written to the RDMA buffer.
                                 Must be a contiguous tensor (including tensor views/slices).
-                                Either src or addr/size must be provided.
         Keyword Args:
             timeout (int, optional): Timeout in seconds for the operation. Defaults to 3s.
 
@@ -335,27 +421,26 @@ class RDMABuffer:
             Currently only CPU tensors are fully supported. GPU tensors will be temporarily
             copied to CPU, which may impact performance.
         """
-
         src_addr, src_size = _get_addr_and_size(src)
 
         if src_size > self.size():
             raise ValueError(
                 f"Source tensor size ({src_size}) must be <= RDMA buffer size ({self.size()})"
             )
+
         local_proc_id = context().actor_instance.proc_id
         client = context().actor_instance
+        buffer = self._buffer
 
         async def write_from_nonblocking() -> None:
-            await _ensure_init_rdma_manager()
-
-            res = await self._buffer.write_from(
+            await _ensure_init_manager()
+            return await buffer.write_from(
                 addr=src_addr,
                 size=src_size,
                 local_proc_id=local_proc_id,
                 client=client,
                 timeout=timeout,
             )
-            return res
 
         return Future(coro=write_from_nonblocking())
 
@@ -365,11 +450,11 @@ class RDMABuffer:
         """
         local_proc_id = context().actor_instance.proc_id
         client = context().actor_instance
+        buffer = self._buffer
 
         async def drop_nonblocking() -> None:
-            await _ensure_init_rdma_manager()
-
-            await self._buffer.drop(
+            await _ensure_init_manager()
+            await buffer.drop(
                 local_proc_id=local_proc_id,
                 client=client,
             )
@@ -399,8 +484,6 @@ class RDMAAction:
 
         READ_INTO = "read_into"
         WRITE_FROM = "write_from"
-        FETCH_ADD = "fetch_add"
-        COMPARE_AND_SWAP = "compare_and_swap"
 
     def __init__(self) -> None:
         self._instructs: List[Tuple[RDMAAction.RDMAOp, RDMABuffer, LocalMemory]] = []
@@ -509,45 +592,6 @@ class RDMAAction:
         self._instructs.append((self.RDMAOp.WRITE_FROM, src, dst))
 
         return self
-
-    def fetch_add(self, src: RDMABuffer, dst: LocalMemory, add: int) -> Self:
-        """
-        Perform atomic fetch-and-add operation on src RDMA buffer.
-
-        Args:
-            src: src RDMA buffer to perform operation on
-            dst: Local memory to store the original value
-            add: Value to add to the src buffer
-
-        Atomically:
-            *dst = *src
-            *src = *src + add
-
-        Note: src/dst are 8 bytes
-        """
-        raise NotImplementedError("Not yet supported")
-
-    def compare_and_swap(
-        self, src: RDMABuffer, dst: LocalMemory, compare: int, swap: int
-    ) -> Self:
-        """
-        Perform atomic compare-and-swap operation on src RDMA buffer.
-
-        Args:
-            src: src RDMA buffer to perform operation on
-            dst: Local memory to store the original value
-            compare: Value to compare against
-            swap: Value to swap in if comparison succeeds
-
-        Atomically:
-            *dst = *src;
-            if (*src == compare) {
-                *src = swap
-            }
-
-        Note: src/dst are 8 bytes
-        """
-        raise NotImplementedError("Not yet supported")
 
     def submit(self) -> Future[None]:
         """

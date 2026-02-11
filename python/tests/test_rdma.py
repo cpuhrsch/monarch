@@ -13,7 +13,13 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import pytest
 import torch
 from monarch.actor import Actor, current_rank, endpoint, this_host
-from monarch.rdma import is_rdma_available, RDMAAction, RDMABuffer
+from monarch.rdma import (
+    get_rdma_backend,
+    is_efa_available,
+    is_rdma_available,
+    RDMAAction,
+    RDMABuffer,
+)
 
 
 needs_cuda = pytest.mark.skipif(
@@ -24,6 +30,34 @@ needs_rdma = pytest.mark.skipif(
     not is_rdma_available(),
     reason="RDMA not available",
 )
+
+
+# ---------------------------------------------------------------------------
+# Utility function tests (no hardware needed)
+# ---------------------------------------------------------------------------
+
+
+def test_is_efa_available_returns_bool():
+    """is_efa_available() should return a bool without crashing."""
+    result = is_efa_available()
+    assert isinstance(result, bool)
+
+
+def test_get_rdma_backend_returns_valid_string():
+    """get_rdma_backend() should return one of the known backend strings."""
+    result = get_rdma_backend()
+    assert result in ("ibverbs", "efa", "none")
+
+
+def test_backend_consistency():
+    """If EFA is available but ibverbs is not, backend should be 'efa'."""
+    if is_efa_available() and not is_rdma_available():
+        assert get_rdma_backend() == "efa"
+
+
+# ---------------------------------------------------------------------------
+# RDMA tests (require hardware)
+# ---------------------------------------------------------------------------
 
 
 class ParameterServer(Actor):
