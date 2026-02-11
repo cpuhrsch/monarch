@@ -77,28 +77,15 @@ _manager_initialized = False
 @functools.cache
 def _ensure_init_manager() -> Shared[None]:
     """Initialize the RDMA manager for this node's backend (ibverbs or EFA)."""
-    backend = get_rdma_backend()
+    async def task() -> None:
+        global _manager_initialized
+        await context().actor_instance.proc_mesh.initialized
+        await (
+            await get_or_spawn_controller("rdma_controller", RdmaController)
+        ).init_on_mesh.call_one(none_throws(context().actor_instance.proc_mesh))
+        _manager_initialized = True
 
-    if backend == "efa":
-        async def task() -> None:
-            global _manager_initialized
-            await context().actor_instance.proc_mesh.initialized
-            await (
-                await get_or_spawn_controller("efa_controller", EfaController)
-            ).init_efa_on_mesh.call_one(none_throws(context().actor_instance.proc_mesh))
-            _manager_initialized = True
-
-        return PythonTask.from_coroutine(task()).spawn()
-    else:
-        async def task() -> None:
-            global _manager_initialized
-            await context().actor_instance.proc_mesh.initialized
-            await (
-                await get_or_spawn_controller("rdma_controller", RdmaController)
-            ).init_rdma_on_mesh.call_one(none_throws(context().actor_instance.proc_mesh))
-            _manager_initialized = True
-
-        return PythonTask.from_coroutine(task()).spawn()
+    return PythonTask.from_coroutine(task()).spawn()
 
 
 def _get_error(buf) -> ValueError:
@@ -156,51 +143,31 @@ def _get_addr_and_size(buf: torch.Tensor | memoryview) -> tuple[int, int]:
 
 class RdmaController(Actor):
     def __init__(self) -> None:
-        self._manager_futures: Dict[ProcMesh, Future[_RdmaManager]] = {}
-
-    @endpoint
-    async def init_rdma_on_mesh(self, proc_mesh: ProcMesh) -> None:
-        # Note: RdmaController acts as coordinator and can run on any node
-        # The RDMA support check should happen on the target proc_mesh nodes, not on RdmaController's node
-
-        if proc_mesh not in self._manager_futures:
-
-            async def create_manager() -> _RdmaManager:
-                proc_mesh_result = await Future(
-                    coro=cast("PythonTask[Any]", proc_mesh._proc_mesh.task())
-                )
-                return none_throws(
-                    await _RdmaManager.create_rdma_manager_nonblocking(
-                        proc_mesh_result, context().actor_instance
-                    )
-                )
-
-            self._manager_futures[proc_mesh] = Future(coro=create_manager())
-
-        await self._manager_futures[proc_mesh]
-
-
-class EfaController(Actor):
-    """Controller for EFA manager actors, similar to RdmaController for ibverbs."""
-
-    def __init__(self) -> None:
         self._manager_futures: Dict[ProcMesh, Future[Any]] = {}
 
     @endpoint
-    async def init_efa_on_mesh(self, proc_mesh: ProcMesh) -> None:
-        from monarch._rust_bindings.rdma import _EfaManager
-
+    async def init_on_mesh(self, proc_mesh: ProcMesh) -> None:
         if proc_mesh not in self._manager_futures:
 
             async def create_manager() -> Any:
                 proc_mesh_result = await Future(
                     coro=cast("PythonTask[Any]", proc_mesh._proc_mesh.task())
                 )
-                return none_throws(
-                    await _EfaManager.create_efa_manager_nonblocking(
-                        proc_mesh_result, context().actor_instance
+                backend = get_rdma_backend()
+                if backend == "efa":
+                    from monarch._rust_bindings.rdma import _EfaManager
+
+                    return none_throws(
+                        await _EfaManager.create_efa_manager_nonblocking(
+                            proc_mesh_result, context().actor_instance
+                        )
                     )
-                )
+                else:
+                    return none_throws(
+                        await _RdmaManager.create_rdma_manager_nonblocking(
+                            proc_mesh_result, context().actor_instance
+                        )
+                    )
 
             self._manager_futures[proc_mesh] = Future(coro=create_manager())
 
