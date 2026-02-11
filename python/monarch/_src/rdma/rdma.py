@@ -271,6 +271,7 @@ class RDMABuffer:
 
         Args:
             data: torch.Tensor or memoryview to create the buffer from. Must be 1d and contiguous.
+                  If provided, addr and size must not be specified.
 
         Raises:
             ValueError: If data is not 1d contiguous, if size is 0, or if data is a GPU tensor.
@@ -282,6 +283,7 @@ class RDMABuffer:
         TODO: Create TensorBuffer, which will be main user API supporting non-contiguous tensors
         """
         if isinstance(data, torch.Tensor) and data.device.type == "cuda":
+            # Check if CUDA caching allocator is using expandable segments
             _check_cuda_expandable_segments_enabled()
 
         self._data = data
@@ -296,13 +298,13 @@ class RDMABuffer:
                 "Tried to create an RDMABuffer, but no RDMA backend is available on this platform."
             )
 
-        # block_on is a no-op if already completed (functools.cache returns same Shared).
         # Skip if already initialized to avoid tokio deadlock when called from actor endpoints.
         if not _manager_initialized:
             _ensure_init_manager().block_on()
 
         try:
             self._buffer = _create_buffer_blocking(addr, size)
+        # TODO - specific exception
         except Exception as e:
             logging.error("Failed to create RDMA buffer %s", e)
             raise e
@@ -351,13 +353,15 @@ class RDMABuffer:
 
         async def read_into_nonblocking() -> Optional[int]:
             await _ensure_init_manager()
-            return await self._buffer.read_into(
+
+            res = await self._buffer.read_into(
                 addr=dst_addr,
                 size=dst_size,
                 local_proc_id=local_proc_id,
                 client=client,
                 timeout=timeout,
             )
+            return res
 
         return Future(coro=read_into_nonblocking())
 
@@ -373,6 +377,7 @@ class RDMABuffer:
         Args:
             src: Source tensor containing data to be written to the RDMA buffer.
                                 Must be a contiguous tensor (including tensor views/slices).
+                                Either src or addr/size must be provided.
         Keyword Args:
             timeout (int, optional): Timeout in seconds for the operation. Defaults to 3s.
 
@@ -387,6 +392,7 @@ class RDMABuffer:
             Currently only CPU tensors are fully supported. GPU tensors will be temporarily
             copied to CPU, which may impact performance.
         """
+
         src_addr, src_size = _get_addr_and_size(src)
 
         if src_size > self.size():
@@ -399,13 +405,15 @@ class RDMABuffer:
 
         async def write_from_nonblocking() -> None:
             await _ensure_init_manager()
-            return await self._buffer.write_from(
+
+            res = await self._buffer.write_from(
                 addr=src_addr,
                 size=src_size,
                 local_proc_id=local_proc_id,
                 client=client,
                 timeout=timeout,
             )
+            return res
 
         return Future(coro=write_from_nonblocking())
 
@@ -418,6 +426,7 @@ class RDMABuffer:
 
         async def drop_nonblocking() -> None:
             await _ensure_init_manager()
+
             await self._buffer.drop(
                 local_proc_id=local_proc_id,
                 client=client,
