@@ -9,15 +9,7 @@ import fire
 import torch
 
 from monarch.actor import Actor, endpoint, enable_transport, shutdown_context
-from monarch.rdma import RDMABuffer, is_rdma_available
-
-try:
-    from monarch.rdma import is_efa_available, get_rdma_backend
-except ImportError:
-    def is_efa_available():
-        return False
-    def get_rdma_backend():
-        return "ibverbs" if is_rdma_available() else "none"
+from monarch.rdma import RDMABuffer, is_rdma_available, get_rdma_backend
 
 
 class PingPongActor(Actor):
@@ -35,7 +27,6 @@ class PingPongActor(Actor):
         return {
             "hostname": self.hostname,
             "rdma_available": is_rdma_available(),
-            "efa_available": is_efa_available(),
             "rdma_backend": get_rdma_backend(),
             "data_size_mb": self.data_size_bytes / (1024 * 1024),
             "data_checksum": self.data.sum().item(),
@@ -225,12 +216,12 @@ def main(
         print("Actor Information:")
         for label, info in [("Actor 0", info0), ("Actor 1", info1)]:
             print(f"  {label}: {info['hostname']}")
-            print(f"    ibverbs: {info['rdma_available']}, EFA: {info['efa_available']}, backend: {info['rdma_backend']}")
+            print(f"    rdma: {info['rdma_available']}, backend: {info['rdma_backend']}")
         print(f"  Actor 0 data checksum: {info0['data_checksum']:.6f}")
         print(f"  Actor 1 data checksum: {info1['data_checksum']:.6f}")
         print()
 
-        if not (info0['rdma_available'] or info0['efa_available']):
+        if not info0['rdma_available']:
             print("ERROR: No RDMA backend available!")
             return
 

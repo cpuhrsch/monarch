@@ -12,7 +12,6 @@ Monarch RDMA API - Public interface for RDMA functionality.
 
 from monarch._src.rdma.rdma import (
     get_rdma_backend,
-    is_efa_available,
     is_rdma_available,
     RDMAAction,
     RDMABuffer,
@@ -22,7 +21,6 @@ from monarch._src.rdma.rdma import (
 
 __all__ = [
     "get_rdma_backend",
-    "is_efa_available",
     "is_rdma_available",
     "RDMABuffer",
     "RDMAAction",

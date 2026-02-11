@@ -50,15 +50,6 @@ def is_rdma_available():
     return _RdmaBuffer.rdma_supported()
 
 
-def is_efa_available() -> bool:
-    """Check if EFA backend is available.
-
-    Returns:
-        bool: True if EFA/libfabric backend is available, False otherwise.
-    """
-    return _RdmaBuffer.efa_supported()
-
-
 def get_rdma_backend() -> str:
     """Return available RDMA backend.
 
@@ -67,7 +58,7 @@ def get_rdma_backend() -> str:
              EFA is preferred when available since ibverbs may detect EFA devices
              but cannot create queue pairs on them.
     """
-    if is_efa_available():
+    if _RdmaBuffer.efa_supported():
         return "efa"
 
     if is_rdma_available():
@@ -78,7 +69,7 @@ def get_rdma_backend() -> str:
 
 # Alias the buffer and manager classes based on backend so the rest of the
 # code needs no branching. Both backends expose the same interface.
-if is_efa_available():
+if _RdmaBuffer.efa_supported():
     from monarch._rust_bindings.rdma import _EfaActorBuffer as _BackendBuffer
     from monarch._rust_bindings.rdma import _EfaManager as _BackendManager
 else:
