@@ -75,7 +75,7 @@ _manager_initialized = False
 
 
 @functools.cache
-def _ensure_init_manager() -> Shared[None]:
+def _ensure_init_rdma_manager() -> Shared[None]:
     """Initialize the RDMA manager for this node's backend (ibverbs or EFA)."""
     async def task() -> None:
         global _manager_initialized
@@ -300,7 +300,7 @@ class RDMABuffer:
 
         # Skip if already initialized to avoid tokio deadlock when called from actor endpoints.
         if not _manager_initialized:
-            _ensure_init_manager().block_on()
+            _ensure_init_rdma_manager().block_on()
 
         try:
             self._buffer = _create_buffer_blocking(addr, size)
@@ -352,7 +352,7 @@ class RDMABuffer:
         client = context().actor_instance
 
         async def read_into_nonblocking() -> Optional[int]:
-            await _ensure_init_manager()
+            await _ensure_init_rdma_manager()
 
             res = await self._buffer.read_into(
                 addr=dst_addr,
@@ -404,7 +404,7 @@ class RDMABuffer:
         client = context().actor_instance
 
         async def write_from_nonblocking() -> None:
-            await _ensure_init_manager()
+            await _ensure_init_rdma_manager()
 
             res = await self._buffer.write_from(
                 addr=src_addr,
@@ -425,7 +425,7 @@ class RDMABuffer:
         client = context().actor_instance
 
         async def drop_nonblocking() -> None:
-            await _ensure_init_manager()
+            await _ensure_init_rdma_manager()
 
             await self._buffer.drop(
                 local_proc_id=local_proc_id,
