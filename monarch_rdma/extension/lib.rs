@@ -201,7 +201,7 @@ impl PyRdmaBuffer {
 
     #[classmethod]
     fn rdma_supported<'py>(_cls: &Bound<'_, PyType>, _py: Python<'py>) -> bool {
-        rdma_supported()
+        rdma_supported() || efa_supported()
     }
 
     #[classmethod]

@@ -47,7 +47,7 @@ warnings.simplefilter("once", RDMAWriteTransferWarning)
 
 
 def is_rdma_available():
-    return _RdmaBuffer.rdma_supported() or _RdmaBuffer.efa_supported()
+    return _RdmaBuffer.rdma_supported()
 
 
 def is_efa_available() -> bool:
