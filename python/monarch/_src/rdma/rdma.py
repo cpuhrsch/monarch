@@ -95,7 +95,7 @@ def _ensure_init_rdma_manager() -> Shared[None]:
         await context().actor_instance.proc_mesh.initialized
         await (
             await get_or_spawn_controller("rdma_controller", RdmaController)
-        ).init_on_mesh.call_one(none_throws(context().actor_instance.proc_mesh))
+        ).init_rdma_on_mesh.call_one(none_throws(context().actor_instance.proc_mesh))
 
     return PythonTask.from_coroutine(task()).spawn()
 
@@ -158,7 +158,7 @@ class RdmaController(Actor):
         self._manager_futures: Dict[ProcMesh, Future[_BackendManager]] = {}
 
     @endpoint
-    async def init_on_mesh(self, proc_mesh: ProcMesh) -> None:
+    async def init_rdma_on_mesh(self, proc_mesh: ProcMesh) -> None:
         if proc_mesh not in self._manager_futures:
 
             async def create_manager() -> _BackendManager:
