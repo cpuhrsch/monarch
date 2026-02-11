@@ -155,13 +155,13 @@ def _get_addr_and_size(buf: torch.Tensor | memoryview) -> tuple[int, int]:
 
 class RdmaController(Actor):
     def __init__(self) -> None:
-        self._manager_futures: Dict[ProcMesh, Future[Any]] = {}
+        self._manager_futures: Dict[ProcMesh, Future[_BackendManager]] = {}
 
     @endpoint
     async def init_on_mesh(self, proc_mesh: ProcMesh) -> None:
         if proc_mesh not in self._manager_futures:
 
-            async def create_manager() -> Any:
+            async def create_manager() -> _BackendManager:
                 proc_mesh_result = await Future(
                     coro=cast("PythonTask[Any]", proc_mesh._proc_mesh.task())
                 )
