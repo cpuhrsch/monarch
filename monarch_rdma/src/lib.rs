@@ -10,7 +10,7 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 pub mod device_selection;
-pub mod efa;
+pub mod efa_primitives;
 pub mod efa_components;
 pub mod efa_manager_actor;
 mod ibverbs_primitives;
@@ -33,8 +33,8 @@ pub use test_utils::is_cuda_available;
 // Re-export EFA support check from rdmaxcel_sys
 pub use rdmaxcel_sys::efa_supported;
 
-// Re-export EFA types from efa module
-pub use efa::{EfaEndpoint, EfaError, EfaResult, efa_available};
+// Re-export EFA types from efa_primitives module
+pub use efa_primitives::{EfaEndpoint, EfaError, EfaResult, efa_available};
 
 // Re-export EFA actor types
 pub use efa_components::EfaBuffer;

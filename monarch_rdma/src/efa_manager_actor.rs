@@ -48,7 +48,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use typeuri::Named;
 
-use crate::efa::EfaEndpoint;
+use crate::efa_primitives::EfaEndpoint;
 use crate::efa_components::EfaBuffer;
 use crate::efa_supported;
 
