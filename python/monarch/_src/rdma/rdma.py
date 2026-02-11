@@ -83,6 +83,9 @@ else:
 def _ensure_init_rdma_manager() -> Shared[None]:
     """Initialize the RDMA manager for this node's backend (ibverbs or EFA)."""
     async def task() -> None:
+        # Ensure the proc mesh is initialized before we can send it over the wire,
+        # since pickling the proc mesh before it is initiliazed would block the
+        # tokio runtime and cause a panic.
         await context().actor_instance.proc_mesh.initialized
         await (
             await get_or_spawn_controller("rdma_controller", RdmaController)
@@ -150,6 +153,9 @@ class RdmaController(Actor):
 
     @endpoint
     async def init_rdma_on_mesh(self, proc_mesh: ProcMesh) -> None:
+        # Note: RdmaController acts as coordinator and can run on any node
+        # The RDMA support check should happen on the target proc_mesh nodes, not on RdmaController's node
+
         if proc_mesh not in self._manager_futures:
 
             async def create_manager() -> _BackendManager:
@@ -230,13 +236,6 @@ def _check_cuda_expandable_segments_enabled() -> bool:
 
 
 class RDMABuffer:
-    """
-    RDMABuffer supports RDMA operations on 1d contiguous tensors or memoryviews.
-
-    Automatically uses whichever RDMA backend is available on this node
-    (ibverbs or EFA — never both).
-    """
-
     def __init__(
         self,
         data: torch.Tensor | memoryview,
