@@ -168,24 +168,6 @@ class RdmaController(Actor):
         await self._manager_futures[proc_mesh]
 
 
-def _create_buffer_blocking(addr: int, size: int) -> Any:
-    """Create the appropriate backend buffer for this node."""
-    backend = get_rdma_backend()
-    ctx = context()
-    if backend == "efa":
-        from monarch._rust_bindings.rdma import _EfaActorBuffer
-
-        return _EfaActorBuffer.create_efa_buffer_blocking(
-            addr=addr, size=size,
-            proc_id=ctx.actor_instance.proc_id, client=ctx.actor_instance,
-        )
-    else:
-        return _RdmaBuffer.create_rdma_buffer_blocking(
-            addr=addr, size=size,
-            proc_id=ctx.actor_instance.proc_id, client=ctx.actor_instance,
-        )
-
-
 def pt_cuda_allocator_compatibility() -> bool:
     """
     Check if PyTorch CUDA caching allocator is compatible with RDMA.
@@ -280,27 +262,39 @@ class RDMABuffer:
             # Check if CUDA caching allocator is using expandable segments
             _check_cuda_expandable_segments_enabled()
 
-        self._data = data
-
-        addr, size = _get_addr_and_size(data)
-
-        if size == 0:
-            raise ValueError("Cannot create RDMABuffer with size 0.")
-
-        if get_rdma_backend() == "none":
-            raise RuntimeError(
-                "Tried to create an RDMABuffer, but no RDMA backend is available on this platform."
-            )
+        assert get_rdma_backend() != "none", (
+            "Tried to create an RDMABuffer, but RDMA is not available on this platform."
+        )
 
         # We need to ensure that _RdmaManager is initialized at this point, because under the hood
         # _RdmaBuffer.create_rdma_buffer_blocking relies on this being the case.
         _ensure_init_rdma_manager().block_on()
 
+        addr, size = _get_addr_and_size(data)
+
         try:
-            self._buffer = _create_buffer_blocking(addr, size)
+            if size == 0:
+                raise ValueError("Cannot create RDMABuffer with size 0.")
+            ctx = context()
+            if get_rdma_backend() == "efa":
+                from monarch._rust_bindings.rdma import _EfaActorBuffer
+
+                self._buffer = _EfaActorBuffer.create_efa_buffer_blocking(
+                    addr=addr,
+                    size=size,
+                    proc_id=ctx.actor_instance.proc_id,
+                    client=ctx.actor_instance,
+                )
+            else:
+                self._buffer = _RdmaBuffer.create_rdma_buffer_blocking(
+                    addr=addr,
+                    size=size,
+                    proc_id=ctx.actor_instance.proc_id,
+                    client=ctx.actor_instance,
+                )
         # TODO - specific exception
         except Exception as e:
-            logging.error("Failed to create RDMA buffer %s", e)
+            logging.error("Failed to create buffer %s", e)
             raise e
 
     @property
