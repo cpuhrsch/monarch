@@ -8,6 +8,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 use std::ops::Deref;
+
 use hyperactor::ActorId;
 use hyperactor::ActorRef;
 use hyperactor::ProcId;
@@ -116,7 +117,7 @@ unsafe extern "C" fn pytorch_segment_scanner(
         Ok(count) => count,
         Err(e) => {
             // Log the specific error for debugging
-            tracing::warn!("[monarch_rdma] pytorch_segment_scanner failed: {}", e);
+            eprintln!("[monarch_rdma] pytorch_segment_scanner failed: {}", e);
             0
         }
     }
