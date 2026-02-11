@@ -71,19 +71,13 @@ def get_rdma_backend() -> str:
 
 # Cached so that we don't have to call out to the root client every time,
 # which may be on a different host.
-_manager_initialized = False
-
-
-@functools.cache
 def _ensure_init_rdma_manager() -> Shared[None]:
     """Initialize the RDMA manager for this node's backend (ibverbs or EFA)."""
     async def task() -> None:
-        global _manager_initialized
         await context().actor_instance.proc_mesh.initialized
         await (
             await get_or_spawn_controller("rdma_controller", RdmaController)
         ).init_on_mesh.call_one(none_throws(context().actor_instance.proc_mesh))
-        _manager_initialized = True
 
     return PythonTask.from_coroutine(task()).spawn()
 
@@ -298,9 +292,9 @@ class RDMABuffer:
                 "Tried to create an RDMABuffer, but no RDMA backend is available on this platform."
             )
 
-        # Skip if already initialized to avoid tokio deadlock when called from actor endpoints.
-        if not _manager_initialized:
-            _ensure_init_rdma_manager().block_on()
+        # We need to ensure that _RdmaManager is initialized at this point, because under the hood
+        # _RdmaBuffer.create_rdma_buffer_blocking relies on this being the case.
+        _ensure_init_rdma_manager().block_on()
 
         try:
             self._buffer = _create_buffer_blocking(addr, size)
