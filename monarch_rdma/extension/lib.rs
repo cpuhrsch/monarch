@@ -430,7 +430,7 @@ async fn create_efa_buffer(
 #[pymethods]
 impl PyEfaActorBuffer {
     #[classmethod]
-    fn create_efa_buffer_nonblocking<'py>(
+    fn create_rdma_buffer_nonblocking<'py>(
         _cls: &Bound<'_, PyType>,
         _py: Python<'py>,
         addr: usize,
@@ -450,7 +450,7 @@ impl PyEfaActorBuffer {
     }
 
     #[classmethod]
-    fn create_efa_buffer_blocking<'py>(
+    fn create_rdma_buffer_blocking<'py>(
         _cls: &Bound<'_, PyType>,
         py: Python<'py>,
         addr: usize,

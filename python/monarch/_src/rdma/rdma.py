@@ -69,6 +69,14 @@ def get_rdma_backend() -> str:
     return "none"
 
 
+# Alias the buffer class based on backend so RDMABuffer.__init__ needs no branching.
+# Both _RdmaBuffer and _EfaActorBuffer have the same interface.
+if is_efa_available():
+    from monarch._rust_bindings.rdma import _EfaActorBuffer as _BackendBuffer
+else:
+    _BackendBuffer = _RdmaBuffer
+
+
 # Cached so that we don't have to call out to the root client every time,
 # which may be on a different host.
 def _ensure_init_rdma_manager() -> Shared[None]:
@@ -276,22 +284,12 @@ class RDMABuffer:
             if size == 0:
                 raise ValueError("Cannot create RDMABuffer with size 0.")
             ctx = context()
-            if get_rdma_backend() == "efa":
-                from monarch._rust_bindings.rdma import _EfaActorBuffer
-
-                self._buffer = _EfaActorBuffer.create_efa_buffer_blocking(
-                    addr=addr,
-                    size=size,
-                    proc_id=ctx.actor_instance.proc_id,
-                    client=ctx.actor_instance,
-                )
-            else:
-                self._buffer = _RdmaBuffer.create_rdma_buffer_blocking(
-                    addr=addr,
-                    size=size,
-                    proc_id=ctx.actor_instance.proc_id,
-                    client=ctx.actor_instance,
-                )
+            self._buffer = _BackendBuffer.create_rdma_buffer_blocking(
+                addr=addr,
+                size=size,
+                proc_id=ctx.actor_instance.proc_id,
+                client=ctx.actor_instance,
+            )
         # TODO - specific exception
         except Exception as e:
             logging.error("Failed to create buffer %s", e)
@@ -387,7 +385,6 @@ class RDMABuffer:
             raise ValueError(
                 f"Source tensor size ({src_size}) must be <= RDMA buffer size ({self.size()})"
             )
-
         local_proc_id = context().actor_instance.proc_id
         client = context().actor_instance
 
