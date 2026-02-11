@@ -46,9 +46,7 @@ class PingPongActor(Actor):
         """Pre-initialize the RDMA/EFA manager to avoid block_on deadlock."""
         from monarch._src.actor.future import Future
         from monarch._src.rdma.rdma import _ensure_init_manager
-        import monarch._src.rdma.rdma as _rdma_mod
         await Future(coro=_ensure_init_manager())
-        _rdma_mod._manager_initialized = True
         return get_rdma_backend()
 
     @endpoint
