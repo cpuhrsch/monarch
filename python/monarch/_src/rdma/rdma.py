@@ -56,11 +56,7 @@ def is_efa_available() -> bool:
     Returns:
         bool: True if EFA/libfabric backend is available, False otherwise.
     """
-    try:
-        return _RdmaBuffer.efa_supported()
-    except AttributeError:
-        # Method not available, EFA not compiled in
-        return False
+    return _RdmaBuffer.efa_supported()
 
 
 def get_rdma_backend() -> str:
@@ -74,11 +70,8 @@ def get_rdma_backend() -> str:
     if is_efa_available():
         return "efa"
 
-    try:
-        if _RdmaBuffer.rdma_supported():
-            return "ibverbs"
-    except Exception:
-        pass
+    if is_rdma_available():
+        return "ibverbs"
 
     return "none"
 
