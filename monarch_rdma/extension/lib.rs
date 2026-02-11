@@ -123,23 +123,24 @@ unsafe extern "C" fn pytorch_segment_scanner(
     }
 }
 
-fn setup_rdma_context(
-    rdma_buffer: &PyRdmaBuffer,
-    local_proc_id: String,
-) -> (ActorRef<RdmaManagerActor>, RdmaBuffer) {
-    let proc_id: ProcId = local_proc_id.parse().unwrap();
-    // TODO: find some better way to look this up, or else formally define "service names"
-    let local_owner_id = ActorId(proc_id, "rdma_manager".to_string(), 0);
-    let local_owner_ref: ActorRef<RdmaManagerActor> = ActorRef::attest(local_owner_id);
-    let buffer = rdma_buffer.buffer.clone();
-    (local_owner_ref, buffer)
+/// Internal buffer representation — either ibverbs or EFA backend.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "backend")]
+enum BufferInner {
+    Ibverbs {
+        buffer: RdmaBuffer,
+        owner_ref: ActorRef<RdmaManagerActor>,
+    },
+    Efa {
+        buffer: EfaBuffer,
+        owner_ref: ActorRef<EfaManagerActor>,
+    },
 }
 
 #[pyclass(name = "_RdmaBuffer", module = "monarch._rust_bindings.rdma")]
 #[derive(Clone, Serialize, Deserialize, Named)]
 struct PyRdmaBuffer {
-    buffer: RdmaBuffer,
-    owner_ref: ActorRef<RdmaManagerActor>,
+    inner: BufferInner,
 }
 
 async fn create_rdma_buffer(
@@ -148,16 +149,23 @@ async fn create_rdma_buffer(
     proc_id: ProcId,
     client: PyInstance,
 ) -> PyResult<PyRdmaBuffer> {
-    // Get the owning RdmaManagerActor's ActorRef
-    // TODO: find some better way to look this up, or else formally define "service names"
-    let owner_id = ActorId(proc_id, "rdma_manager".to_string(), 0);
-    let owner_ref: ActorRef<RdmaManagerActor> = ActorRef::attest(owner_id);
-
-    // Create the RdmaBuffer
-    let buffer = owner_ref
-        .request_buffer_deprecated(client.deref(), addr, size)
-        .await?;
-    Ok(PyRdmaBuffer { buffer, owner_ref })
+    if efa_supported() {
+        // TODO: find some better way to look this up, or else formally define "service names"
+        let owner_id = ActorId(proc_id, "efa_manager".to_string(), 0);
+        let owner_ref: ActorRef<EfaManagerActor> = ActorRef::attest(owner_id);
+        let buffer = owner_ref
+            .request_buffer(client.deref(), addr, size)
+            .await?;
+        Ok(PyRdmaBuffer { inner: BufferInner::Efa { buffer, owner_ref } })
+    } else {
+        // TODO: find some better way to look this up, or else formally define "service names"
+        let owner_id = ActorId(proc_id, "rdma_manager".to_string(), 0);
+        let owner_ref: ActorRef<RdmaManagerActor> = ActorRef::attest(owner_id);
+        let buffer = owner_ref
+            .request_buffer_deprecated(client.deref(), addr, size)
+            .await?;
+        Ok(PyRdmaBuffer { inner: BufferInner::Ibverbs { buffer, owner_ref } })
+    }
 }
 
 #[pymethods]
@@ -171,7 +179,7 @@ impl PyRdmaBuffer {
         proc_id: String,
         client: PyInstance,
     ) -> PyResult<PyPythonTask> {
-        if !rdma_supported() {
+        if !rdma_supported() && !efa_supported() {
             return Err(PyException::new_err("RDMA is not supported on this system"));
         }
         PyPythonTask::new(create_rdma_buffer(
@@ -191,7 +199,7 @@ impl PyRdmaBuffer {
         proc_id: String,
         client: PyInstance,
     ) -> PyResult<PyRdmaBuffer> {
-        if !rdma_supported() {
+        if !rdma_supported() && !efa_supported() {
             return Err(PyException::new_err("RDMA is not supported on this system"));
         }
         signal_safe_block_on(
@@ -212,7 +220,10 @@ impl PyRdmaBuffer {
 
     #[pyo3(name = "__repr__")]
     fn repr(&self) -> String {
-        format!("<RdmaBuffer'{:?}'>", self.buffer)
+        match &self.inner {
+            BufferInner::Ibverbs { buffer, .. } => format!("<RdmaBuffer'{:?}'>", buffer),
+            BufferInner::Efa { buffer, .. } => format!("<RdmaBuffer'{:?}'>", buffer),
+        }
     }
 
     /// Reads data from the local buffer and places it into this remote RDMA buffer.
@@ -237,20 +248,44 @@ impl PyRdmaBuffer {
         client: PyInstance,
         timeout: u64,
     ) -> PyResult<PyPythonTask> {
-        let (local_owner_ref, buffer) = setup_rdma_context(self, local_proc_id);
-        PyPythonTask::new(async move {
-            let local_buffer = local_owner_ref
-                .request_buffer_deprecated(client.deref(), addr, size)
-                .await?;
-            local_buffer
-                .write_from(client.deref(), buffer, timeout)
-                .await
-                .map_err(|e| PyException::new_err(format!("failed to read into buffer: {}", e)))?;
-            local_owner_ref
-                .release_buffer_deprecated(client.deref(), local_buffer)
-                .await?;
-            Ok(())
-        })
+        match &self.inner {
+            BufferInner::Ibverbs { buffer, .. } => {
+                let proc_id: ProcId = local_proc_id.parse().unwrap();
+                let local_owner_id = ActorId(proc_id, "rdma_manager".to_string(), 0);
+                let local_owner_ref: ActorRef<RdmaManagerActor> = ActorRef::attest(local_owner_id);
+                let buffer = buffer.clone();
+                PyPythonTask::new(async move {
+                    let local_buffer = local_owner_ref
+                        .request_buffer_deprecated(client.deref(), addr, size)
+                        .await?;
+                    local_buffer
+                        .write_from(client.deref(), buffer, timeout)
+                        .await
+                        .map_err(|e| PyException::new_err(format!("failed to read into buffer: {}", e)))?;
+                    local_owner_ref
+                        .release_buffer_deprecated(client.deref(), local_buffer)
+                        .await?;
+                    Ok(())
+                })
+            }
+            BufferInner::Efa { buffer, .. } => {
+                let proc_id: ProcId = local_proc_id.parse().unwrap();
+                let local_owner_id = ActorId(proc_id, "efa_manager".to_string(), 0);
+                let local_owner_ref: ActorRef<EfaManagerActor> = ActorRef::attest(local_owner_id);
+                let buffer = buffer.clone();
+                PyPythonTask::new(async move {
+                    let local_buffer = local_owner_ref
+                        .request_buffer(client.deref(), addr, size)
+                        .await
+                        .map_err(|e| PyException::new_err(format!("failed to request EFA buffer: {}", e)))?;
+                    local_buffer
+                        .write_from(client.deref(), buffer, timeout)
+                        .await
+                        .map_err(|e| PyException::new_err(format!("failed to read into buffer: {}", e)))?;
+                    Ok(())
+                })
+            }
+        }
     }
 
     /// Writes data from this remote RDMA buffer into a local buffer.
@@ -275,24 +310,51 @@ impl PyRdmaBuffer {
         client: PyInstance,
         timeout: u64,
     ) -> PyResult<PyPythonTask> {
-        let (local_owner_ref, buffer) = setup_rdma_context(self, local_proc_id);
-        PyPythonTask::new(async move {
-            let local_buffer = local_owner_ref
-                .request_buffer_deprecated(client.deref(), addr, size)
-                .await?;
-            local_buffer
-                .read_into(client.deref(), buffer, timeout)
-                .await
-                .map_err(|e| PyException::new_err(format!("failed to write from buffer: {}", e)))?;
-            local_owner_ref
-                .release_buffer_deprecated(client.deref(), local_buffer)
-                .await?;
-            Ok(())
-        })
+        match &self.inner {
+            BufferInner::Ibverbs { buffer, .. } => {
+                let proc_id: ProcId = local_proc_id.parse().unwrap();
+                let local_owner_id = ActorId(proc_id, "rdma_manager".to_string(), 0);
+                let local_owner_ref: ActorRef<RdmaManagerActor> = ActorRef::attest(local_owner_id);
+                let buffer = buffer.clone();
+                PyPythonTask::new(async move {
+                    let local_buffer = local_owner_ref
+                        .request_buffer_deprecated(client.deref(), addr, size)
+                        .await?;
+                    local_buffer
+                        .read_into(client.deref(), buffer, timeout)
+                        .await
+                        .map_err(|e| PyException::new_err(format!("failed to write from buffer: {}", e)))?;
+                    local_owner_ref
+                        .release_buffer_deprecated(client.deref(), local_buffer)
+                        .await?;
+                    Ok(())
+                })
+            }
+            BufferInner::Efa { buffer, .. } => {
+                let proc_id: ProcId = local_proc_id.parse().unwrap();
+                let local_owner_id = ActorId(proc_id, "efa_manager".to_string(), 0);
+                let local_owner_ref: ActorRef<EfaManagerActor> = ActorRef::attest(local_owner_id);
+                let buffer = buffer.clone();
+                PyPythonTask::new(async move {
+                    let local_buffer = local_owner_ref
+                        .request_buffer(client.deref(), addr, size)
+                        .await
+                        .map_err(|e| PyException::new_err(format!("failed to request EFA buffer: {}", e)))?;
+                    buffer
+                        .write_from(client.deref(), local_buffer, timeout)
+                        .await
+                        .map_err(|e| PyException::new_err(format!("failed to write from buffer: {}", e)))?;
+                    Ok(())
+                })
+            }
+        }
     }
 
     fn size(&self) -> usize {
-        self.buffer.size
+        match &self.inner {
+            BufferInner::Ibverbs { buffer, .. } => buffer.size,
+            BufferInner::Efa { buffer, .. } => buffer.size(),
+        }
     }
 
     fn __reduce__(&self) -> PyResult<(PyObject, PyObject)> {
@@ -320,39 +382,51 @@ impl PyRdmaBuffer {
         local_proc_id: String,
         client: PyInstance,
     ) -> PyResult<PyPythonTask> {
-        let (_local_owner_ref, buffer) = setup_rdma_context(self, local_proc_id);
-        PyPythonTask::new(async move {
-            buffer
-                .drop_buffer(client.deref())
-                .await
-                .map_err(|e| PyException::new_err(format!("Failed to drop buffer: {}", e)))?;
-            Ok(())
-        })
+        match &self.inner {
+            BufferInner::Ibverbs { buffer, .. } => {
+                let buffer = buffer.clone();
+                PyPythonTask::new(async move {
+                    buffer
+                        .drop_buffer(client.deref())
+                        .await
+                        .map_err(|e| PyException::new_err(format!("Failed to drop buffer: {}", e)))?;
+                    Ok(())
+                })
+            }
+            BufferInner::Efa { buffer, .. } => {
+                let buffer = buffer.clone();
+                PyPythonTask::new(async move {
+                    buffer
+                        .drop_buffer(client.deref())
+                        .await
+                        .map_err(|e| PyException::new_err(format!("Failed to drop buffer: {}", e)))?;
+                    Ok(())
+                })
+            }
+        }
     }
 
     fn owner_actor_id(&self) -> String {
-        self.owner_ref.actor_id().to_string()
+        match &self.inner {
+            BufferInner::Ibverbs { owner_ref, .. } => owner_ref.actor_id().to_string(),
+            BufferInner::Efa { owner_ref, .. } => owner_ref.actor_id().to_string(),
+        }
     }
 }
 
 #[pyclass(name = "_RdmaManager", module = "monarch._rust_bindings.rdma")]
 pub struct PyRdmaManager {
-    #[allow(dead_code)] // field never read
-    inner: SharedCell<RootActorMesh<'static, RdmaManagerActor>>,
-    device: String,
+    #[allow(dead_code)]
+    _inner: Box<dyn std::any::Any + Send>,
 }
 
 #[pymethods]
 impl PyRdmaManager {
     #[pyo3(name = "__repr__")]
     fn repr(&self) -> String {
-        format!("<RdmaManager(device='{}')>", self.device)
+        "<RdmaManager>".to_string()
     }
 
-    #[getter]
-    fn device(&self) -> &str {
-        &self.device
-    }
     /// Creates an RDMA manager actor on the given ProcMesh (async version).
     /// Returns the actor mesh if RDMA is supported, None otherwise.
     #[classmethod]
@@ -364,270 +438,34 @@ impl PyRdmaManager {
         tracing::debug!("spawning RDMA manager on target proc_mesh nodes");
 
         let proc_mesh = proc_mesh.downcast::<PyProcMesh>()?.borrow().mesh_ref()?;
-        PyPythonTask::new(async move {
-            let actor_mesh: hyperactor_mesh::v1::ActorMesh<RdmaManagerActor> = proc_mesh
-                // Pass None to use default config - RdmaManagerActor will use default IbverbsConfig
-                // TODO - make IbverbsConfig configurable
-                .spawn_service(client.deref(), "rdma_manager", &None)
-                .await
-                .map_err(|err| PyException::new_err(err.to_string()))?;
 
-            let actor_mesh = RootActorMesh::from(actor_mesh);
-            let actor_mesh = SharedCell::from(actor_mesh);
+        if efa_supported() {
+            PyPythonTask::new(async move {
+                let actor_mesh: hyperactor_mesh::v1::ActorMesh<EfaManagerActor> = proc_mesh
+                    .spawn_service(client.deref(), "efa_manager", &())
+                    .await
+                    .map_err(|err| PyException::new_err(err.to_string()))?;
 
-            Ok(Some(PyRdmaManager {
-                inner: actor_mesh,
-                device: "remote_rdma_device".to_string(),
-            }))
-        })
-    }
-}
+                let actor_mesh = RootActorMesh::from(actor_mesh);
+                let inner: Box<dyn std::any::Any + Send> = Box::new(SharedCell::from(actor_mesh));
 
-// ============================================================================
-// Actor-based EFA Buffer (picklable, uses EfaManagerActor)
-// ============================================================================
+                Ok(Some(PyRdmaManager { _inner: inner }))
+            })
+        } else {
+            PyPythonTask::new(async move {
+                let actor_mesh: hyperactor_mesh::v1::ActorMesh<RdmaManagerActor> = proc_mesh
+                    // Pass None to use default config - RdmaManagerActor will use default IbverbsConfig
+                    // TODO - make IbverbsConfig configurable
+                    .spawn_service(client.deref(), "rdma_manager", &None)
+                    .await
+                    .map_err(|err| PyException::new_err(err.to_string()))?;
 
-fn setup_efa_context(
-    efa_buffer: &PyEfaActorBuffer,
-    local_proc_id: String,
-) -> (ActorRef<EfaManagerActor>, EfaBuffer) {
-    let proc_id: ProcId = local_proc_id.parse().unwrap();
-    // TODO: find some better way to look this up, or else formally define "service names"
-    let local_owner_id = ActorId(proc_id, "efa_manager".to_string(), 0);
-    let local_owner_ref: ActorRef<EfaManagerActor> = ActorRef::attest(local_owner_id);
-    let buffer = efa_buffer.buffer.clone();
-    (local_owner_ref, buffer)
-}
+                let actor_mesh = RootActorMesh::from(actor_mesh);
+                let inner: Box<dyn std::any::Any + Send> = Box::new(SharedCell::from(actor_mesh));
 
-/// Actor-based EFA buffer that supports pickling.
-///
-/// This class wraps an EfaBuffer (from efa_components.rs) and uses EfaManagerActor
-/// for coordination, similar to how PyRdmaBuffer uses RdmaManagerActor.
-#[pyclass(name = "_EfaActorBuffer", module = "monarch._rust_bindings.rdma")]
-#[derive(Clone, Serialize, Deserialize, Named)]
-struct PyEfaActorBuffer {
-    buffer: EfaBuffer,
-    owner_ref: ActorRef<EfaManagerActor>,
-}
-
-async fn create_efa_buffer(
-    addr: usize,
-    size: usize,
-    proc_id: ProcId,
-    client: PyInstance,
-) -> PyResult<PyEfaActorBuffer> {
-    // Get the owning EfaManagerActor's ActorRef
-    // TODO: find some better way to look this up, or else formally define "service names"
-    let owner_id = ActorId(proc_id, "efa_manager".to_string(), 0);
-    let owner_ref: ActorRef<EfaManagerActor> = ActorRef::attest(owner_id);
-
-    // Create the EfaBuffer
-    let buffer = owner_ref
-        .request_buffer(client.deref(), addr, size)
-        .await?;
-    Ok(PyEfaActorBuffer { buffer, owner_ref })
-}
-
-#[pymethods]
-impl PyEfaActorBuffer {
-    #[classmethod]
-    fn create_rdma_buffer_nonblocking<'py>(
-        _cls: &Bound<'_, PyType>,
-        _py: Python<'py>,
-        addr: usize,
-        size: usize,
-        proc_id: String,
-        client: PyInstance,
-    ) -> PyResult<PyPythonTask> {
-        if !efa_supported() {
-            return Err(PyException::new_err("EFA is not supported on this system"));
+                Ok(Some(PyRdmaManager { _inner: inner }))
+            })
         }
-        PyPythonTask::new(create_efa_buffer(
-            addr,
-            size,
-            proc_id.parse().unwrap(),
-            client,
-        ))
-    }
-
-    #[classmethod]
-    fn create_rdma_buffer_blocking<'py>(
-        _cls: &Bound<'_, PyType>,
-        py: Python<'py>,
-        addr: usize,
-        size: usize,
-        proc_id: String,
-        client: PyInstance,
-    ) -> PyResult<PyEfaActorBuffer> {
-        if !efa_supported() {
-            return Err(PyException::new_err("EFA is not supported on this system"));
-        }
-        signal_safe_block_on(
-            py,
-            create_efa_buffer(addr, size, proc_id.parse().unwrap(), client),
-        )?
-    }
-
-    #[classmethod]
-    fn efa_supported<'py>(_cls: &Bound<'_, PyType>, _py: Python<'py>) -> bool {
-        efa_supported()
-    }
-
-    #[pyo3(name = "__repr__")]
-    fn repr(&self) -> String {
-        format!("<EfaActorBuffer'{:?}'>", self.buffer)
-    }
-
-    /// Reads data from the local buffer and places it into this remote EFA buffer.
-    ///
-    /// # Arguments
-    /// * `addr` - The address of the local buffer to read from
-    /// * `size` - The size of the data to transfer
-    /// * `local_proc_id` - The process ID where the local buffer resides
-    /// * `client` - The actor who does the reading
-    /// * `timeout` - Maximum time in seconds to wait for the operation
-    #[pyo3(signature = (addr, size, local_proc_id, client, timeout))]
-    fn read_into<'py>(
-        &self,
-        _py: Python<'py>,
-        addr: usize,
-        size: usize,
-        local_proc_id: String,
-        client: PyInstance,
-        timeout: u64,
-    ) -> PyResult<PyPythonTask> {
-        let (local_owner_ref, buffer) = setup_efa_context(self, local_proc_id);
-        PyPythonTask::new(async move {
-            let local_buffer = local_owner_ref
-                .request_buffer(client.deref(), addr, size)
-                .await
-                .map_err(|e| PyException::new_err(format!("failed to request EFA buffer: {}", e)))?;
-            local_buffer
-                .write_from(client.deref(), buffer, timeout)
-                .await
-                .map_err(|e| PyException::new_err(format!("failed to read into buffer: {}", e)))?;
-            // Don't release — MRs are cached and reused across transfers.
-            // Cleanup happens when the EfaManagerActor is dropped.
-            Ok(())
-        })
-    }
-
-    /// Writes data from this remote EFA buffer into a local buffer.
-    ///
-    /// # Arguments
-    /// * `addr` - The address of the local buffer to write to
-    /// * `size` - The size of the data to transfer
-    /// * `local_proc_id` - The process ID where the local buffer resides
-    /// * `client` - The actor who does the writing
-    /// * `timeout` - Maximum time in seconds to wait for the operation
-    #[pyo3(signature = (addr, size, local_proc_id, client, timeout))]
-    fn write_from<'py>(
-        &self,
-        _py: Python<'py>,
-        addr: usize,
-        size: usize,
-        local_proc_id: String,
-        client: PyInstance,
-        timeout: u64,
-    ) -> PyResult<PyPythonTask> {
-        let (local_owner_ref, buffer) = setup_efa_context(self, local_proc_id);
-        PyPythonTask::new(async move {
-            let local_buffer = local_owner_ref
-                .request_buffer(client.deref(), addr, size)
-                .await
-                .map_err(|e| PyException::new_err(format!("failed to request EFA buffer: {}", e)))?;
-            // buffer = remote dest, local_buffer = local source
-            // write_from(source) pushes data from source to dest
-            buffer
-                .write_from(client.deref(), local_buffer, timeout)
-                .await
-                .map_err(|e| PyException::new_err(format!("failed to write from buffer: {}", e)))?;
-            Ok(())
-        })
-    }
-
-    fn size(&self) -> usize {
-        self.buffer.size()
-    }
-
-    fn __reduce__(&self) -> PyResult<(PyObject, PyObject)> {
-        Python::with_gil(|py| {
-            let ctor = py.get_type::<PyEfaActorBuffer>().into_py_any(py)?;
-            let json = serde_json::to_string(self).map_err(|e| {
-                PyErr::new::<PyValueError, _>(format!("Serialization failed: {}", e))
-            })?;
-
-            let args = PyTuple::new(py, [json])?.into_py_any(py)?;
-            Ok((ctor, args))
-        })
-    }
-
-    #[new]
-    fn new_from_json(json: &str) -> PyResult<Self> {
-        let deserialized: PyEfaActorBuffer = serde_json::from_str(json)
-            .map_err(|e| PyErr::new::<PyValueError, _>(format!("Deserialization failed: {}", e)))?;
-        Ok(deserialized)
-    }
-
-    fn drop<'py>(
-        &self,
-        _py: Python<'py>,
-        local_proc_id: String,
-        client: PyInstance,
-    ) -> PyResult<PyPythonTask> {
-        let (_local_owner_ref, buffer) = setup_efa_context(self, local_proc_id);
-        PyPythonTask::new(async move {
-            buffer
-                .drop_buffer(client.deref())
-                .await
-                .map_err(|e| PyException::new_err(format!("Failed to drop buffer: {}", e)))?;
-            Ok(())
-        })
-    }
-
-    fn owner_actor_id(&self) -> String {
-        self.owner_ref.actor_id().to_string()
-    }
-}
-
-/// Python wrapper for the EFA Manager actor mesh.
-#[pyclass(name = "_EfaManager", module = "monarch._rust_bindings.rdma")]
-pub struct PyEfaManager {
-    #[allow(dead_code)] // field never read
-    inner: SharedCell<RootActorMesh<'static, EfaManagerActor>>,
-}
-
-#[pymethods]
-impl PyEfaManager {
-    #[pyo3(name = "__repr__")]
-    fn repr(&self) -> String {
-        "<EfaManager>".to_string()
-    }
-
-    /// Creates an EFA manager actor on the given ProcMesh (async version).
-    /// Returns the actor mesh if EFA is supported, None otherwise.
-    #[classmethod]
-    fn create_rdma_manager_nonblocking(
-        _cls: &Bound<'_, PyType>,
-        proc_mesh: &Bound<'_, PyAny>,
-        client: PyInstance,
-    ) -> PyResult<PyPythonTask> {
-        tracing::debug!("spawning EFA manager on target proc_mesh nodes");
-
-        let proc_mesh = proc_mesh.downcast::<PyProcMesh>()?.borrow().mesh_ref()?;
-        PyPythonTask::new(async move {
-            let actor_mesh: hyperactor_mesh::v1::ActorMesh<EfaManagerActor> = proc_mesh
-                .spawn_service(client.deref(), "efa_manager", &())
-                .await
-                .map_err(|err| PyException::new_err(err.to_string()))?;
-
-            let actor_mesh = RootActorMesh::from(actor_mesh);
-            let actor_mesh = SharedCell::from(actor_mesh);
-
-            Ok(Some(PyEfaManager {
-                inner: actor_mesh,
-            }))
-        })
     }
 }
 
@@ -638,7 +476,5 @@ pub fn register_python_bindings(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
     module.add_class::<PyRdmaBuffer>()?;
     module.add_class::<PyRdmaManager>()?;
-    module.add_class::<PyEfaActorBuffer>()?;
-    module.add_class::<PyEfaManager>()?;
     Ok(())
 }

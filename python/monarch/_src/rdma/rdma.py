@@ -67,15 +67,6 @@ def get_rdma_backend() -> str:
     return "none"
 
 
-# Alias the buffer and manager classes based on backend so the rest of the
-# code needs no branching. Both backends expose the same interface.
-if _RdmaBuffer.efa_supported():
-    from monarch._rust_bindings.rdma import _EfaActorBuffer as _BackendBuffer
-    from monarch._rust_bindings.rdma import _EfaManager as _BackendManager
-else:
-    _BackendBuffer = _RdmaBuffer
-    _BackendManager = _RdmaManager
-
 
 # Cached so that we don't have to call out to the root client every time,
 # which may be on a different host.
@@ -149,7 +140,7 @@ def _get_addr_and_size(buf: torch.Tensor | memoryview) -> tuple[int, int]:
 
 class RdmaController(Actor):
     def __init__(self) -> None:
-        self._manager_futures: Dict[ProcMesh, Future[_BackendManager]] = {}
+        self._manager_futures: Dict[ProcMesh, Future[_RdmaManager]] = {}
 
     @endpoint
     async def init_rdma_on_mesh(self, proc_mesh: ProcMesh) -> None:
@@ -158,12 +149,12 @@ class RdmaController(Actor):
 
         if proc_mesh not in self._manager_futures:
 
-            async def create_manager() -> _BackendManager:
+            async def create_manager() -> _RdmaManager:
                 proc_mesh_result = await Future(
                     coro=cast("PythonTask[Any]", proc_mesh._proc_mesh.task())
                 )
                 return none_throws(
-                    await _BackendManager.create_rdma_manager_nonblocking(
+                    await _RdmaManager.create_rdma_manager_nonblocking(
                         proc_mesh_result, context().actor_instance
                     )
                 )
@@ -274,7 +265,7 @@ class RDMABuffer:
             if size == 0:
                 raise ValueError("Cannot create RDMABuffer with size 0.")
             ctx = context()
-            self._buffer = _BackendBuffer.create_rdma_buffer_blocking(
+            self._buffer = _RdmaBuffer.create_rdma_buffer_blocking(
                 addr=addr,
                 size=size,
                 proc_id=ctx.actor_instance.proc_id,
