@@ -433,38 +433,55 @@ static int poll_cq(rdmaxcel_efa_ep_t* ep, int max_spins) {
   return 0;
 }
 
-int rdmaxcel_efa_post_write(
+int rdmaxcel_efa_push_data(
     rdmaxcel_efa_ep_t* ep,
     void* local_addr,
     size_t size,
     uint64_t remote_addr,
     uint64_t remote_key,
-    uint64_t peer) {
+    uint64_t peer,
+    uint64_t tag) {
   if (!ep || !local_addr || size == 0) {
     return EFA_ERROR_INVALID_PARAMS;
   }
   void* desc = find_mr_desc(ep, local_addr);
   if (!desc) {
-    EFA_DEBUG("[EFA] post_write: no MR found covering local_addr=%p\n", local_addr);
+    EFA_DEBUG("[EFA] push_data: no MR found covering local_addr=%p\n", local_addr);
     return EFA_ERROR_INVALID_PARAMS;
   }
-  return post_write(ep, local_addr, size, desc, static_cast<fi_addr_t>(peer),
-                    remote_addr, remote_key);
+
+  fi_addr_t fi_peer = static_cast<fi_addr_t>(peer);
+  int ret;
+
+  ret = post_write(ep, local_addr, size, desc, fi_peer, remote_addr, remote_key);
+  if (ret != EFA_SUCCESS) return ret;
+
+  int completions = poll_cq(ep, 0);
+  if (completions <= 0) return (completions < 0) ? completions : EFA_ERROR_TIMEOUT;
+
+  ret = post_tsend(ep, tag, fi_peer);
+  if (ret != EFA_SUCCESS) return ret;
+
+  completions = poll_cq(ep, 0);
+  if (completions <= 0) return (completions < 0) ? completions : EFA_ERROR_TIMEOUT;
+
+  return EFA_SUCCESS;
 }
 
-int rdmaxcel_efa_post_tsend(rdmaxcel_efa_ep_t* ep, uint64_t tag, uint64_t peer) {
-  if (!ep) return EFA_ERROR_INVALID_PARAMS;
-  return post_tsend(ep, tag, static_cast<fi_addr_t>(peer));
-}
+int rdmaxcel_efa_wait_for_data(
+    rdmaxcel_efa_ep_t* ep,
+    uint64_t tag) {
+  if (!ep) {
+    return EFA_ERROR_INVALID_PARAMS;
+  }
 
-int rdmaxcel_efa_post_trecv(rdmaxcel_efa_ep_t* ep, uint64_t tag) {
-  if (!ep) return EFA_ERROR_INVALID_PARAMS;
-  return post_trecv(ep, tag);
-}
+  int ret = post_trecv(ep, tag);
+  if (ret != EFA_SUCCESS) return ret;
 
-int rdmaxcel_efa_poll_cq(rdmaxcel_efa_ep_t* ep, int max_spins) {
-  if (!ep) return EFA_ERROR_INVALID_PARAMS;
-  return poll_cq(ep, max_spins);
+  int completions = poll_cq(ep, 0);
+  if (completions <= 0) return (completions < 0) ? completions : EFA_ERROR_TIMEOUT;
+
+  return EFA_SUCCESS;
 }
 
 const char* rdmaxcel_efa_error_string(int error_code) {

@@ -51,46 +51,6 @@ use crate::efa_primitives::EfaEndpoint;
 use crate::efa_components::EfaBuffer;
 use crate::efa_supported;
 
-const POLL_SPINS_PER_BATCH: i32 = 100_000;
-
-/// Yield control back to the async runtime, allowing other tasks
-/// (including hyperactor session heartbeats) to make progress.
-async fn async_yield_now() {
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-
-    struct YieldNow(bool);
-
-    impl Future for YieldNow {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            if self.0 {
-                Poll::Ready(())
-            } else {
-                self.0 = true;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
-
-    YieldNow(false).await
-}
-
-/// Poll CQ in batches, yielding between batches for heartbeats.
-async fn poll_for_completion(endpoint: &EfaEndpoint) -> Result<(), anyhow::Error> {
-    loop {
-        let completions = endpoint.poll_cq(POLL_SPINS_PER_BATCH).map_err(|e| {
-            anyhow::anyhow!("CQ poll failed: {}", e)
-        })?;
-        if completions > 0 {
-            return Ok(());
-        }
-        async_yield_now().await;
-    }
-}
-
 /// Messages handled by EfaManagerActor
 #[derive(Handler, HandleClient, RefClient, Debug, Serialize, Deserialize, Named)]
 pub enum EfaManagerMessage {
@@ -380,18 +340,12 @@ impl EfaManagerMessageHandler for EfaManagerActor {
             fi_addr
         };
 
-        // Source-side transfer: post_write → poll → post_tsend → poll
-        endpoint.post_write(
+        // Push data to dest and send completion notification (blocks in C until done)
+        endpoint.push_data(
             local_mr.addr, size,
-            remote_buffer.mr_addr as u64, remote_buffer.mr_key, peer,
-        ).map_err(|e| anyhow::anyhow!("Failed to post write: {}", e))?;
-
-        poll_for_completion(endpoint).await?;
-
-        endpoint.post_tsend(tag, peer)
-            .map_err(|e| anyhow::anyhow!("Failed to post tsend: {}", e))?;
-
-        poll_for_completion(endpoint).await?;
+            remote_buffer.mr_addr as u64, remote_buffer.mr_key,
+            peer, tag,
+        ).map_err(|e| anyhow::anyhow!("Failed to push data: {}", e))?;
 
         Ok(true)
     }
@@ -419,11 +373,10 @@ impl EfaManagerMessageHandler for EfaManagerActor {
             self.known_peers.insert(remote_buffer.endpoint_addr.clone(), fi_addr);
         }
 
-        // Dest-side: post_trecv → poll (also drives fi_write progress)
-        endpoint.post_trecv(notification_tag)
-            .map_err(|e| anyhow::anyhow!("Failed to post trecv: {}", e))?;
-
-        poll_for_completion(endpoint).await?;
+        // Wait for source's data push and completion notification (blocks in C until done)
+        endpoint.wait_for_data(notification_tag).map_err(|e| {
+            anyhow::anyhow!("Failed to wait for data: {}", e)
+        })?;
 
         Ok(())
     }
