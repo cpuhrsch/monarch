@@ -131,14 +131,11 @@ int rdmaxcel_efa_read(
     uint64_t remote_key,
     uint64_t peer);
 
-// Poll for completion of RDMA operations
+// Poll for completion of RDMA operations (non-blocking)
 // Parameters:
 //   ep: EFA endpoint
-//   timeout_ms: Timeout in milliseconds (-1 for infinite)
-// Returns: Number of completions on success, negative error code on failure
-int rdmaxcel_efa_poll_cq(
-    rdmaxcel_efa_ep_t* ep,
-    int timeout_ms);
+// Returns: Number of completions (0 = none available), negative error code on failure
+int rdmaxcel_efa_poll_cq(rdmaxcel_efa_ep_t* ep);
 
 // Send a tagged message (for completion notification)
 // Parameters:

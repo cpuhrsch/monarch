@@ -95,7 +95,7 @@ async fn poll_for_completion(
     const SPINS_BEFORE_YIELD: u32 = 10_000;
     let mut spin_count: u32 = 0;
     loop {
-        let completions = endpoint.poll_cq(0).map_err(|e| {
+        let completions = endpoint.poll_cq().map_err(|e| {
             anyhow::anyhow!("Failed to poll for {} completion: {}", operation, e)
         })?;
         if completions > 0 {

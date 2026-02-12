@@ -462,55 +462,18 @@ int rdmaxcel_efa_read(
   return EFA_ERROR_READ_FAILED;
 }
 
-int rdmaxcel_efa_poll_cq(rdmaxcel_efa_ep_t* ep, int timeout_ms) {
+int rdmaxcel_efa_poll_cq(rdmaxcel_efa_ep_t* ep) {
   if (!ep) {
     return EFA_ERROR_INVALID_PARAMS;
   }
 
   struct fi_cq_tagged_entry entry;
-  ssize_t ret;
-
-  if (timeout_ms == 0) {
-    // Non-blocking poll
-    ret = fi_cq_read(ep->cq, &entry, 1);
-  } else if (timeout_ms < 0) {
-    // Blocking wait - poll in a loop
-    while (true) {
-      ret = fi_cq_read(ep->cq, &entry, 1);
-      if (ret > 0 || (ret < 0 && ret != -FI_EAGAIN)) {
-        break;
-      }
-    }
-  } else {
-    // Timed wait - busy poll with timeout check
-    // (fi_cq_sread requires FI_WAIT_FD which we don't use)
-    struct timespec start_time, current_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-    int64_t timeout_ns = static_cast<int64_t>(timeout_ms) * 1000000LL;
-
-    while (true) {
-      ret = fi_cq_read(ep->cq, &entry, 1);
-      if (ret > 0 || (ret < 0 && ret != -FI_EAGAIN)) {
-        break;
-      }
-
-      // Check if timeout has elapsed
-      clock_gettime(CLOCK_MONOTONIC, &current_time);
-      int64_t elapsed_ns = (current_time.tv_sec - start_time.tv_sec) * 1000000000LL +
-                           (current_time.tv_nsec - start_time.tv_nsec);
-      if (elapsed_ns >= timeout_ns) {
-        ret = -FI_EAGAIN;  // Treat as no completions available
-        break;
-      }
-    }
-  }
+  ssize_t ret = fi_cq_read(ep->cq, &entry, 1);
 
   if (ret > 0) {
     return static_cast<int>(ret);
   } else if (ret == -FI_EAGAIN) {
     return 0; // No completions available
-  } else if (ret == -FI_ETIMEDOUT) {
-    return EFA_ERROR_TIMEOUT;
   } else if (ret == -FI_EAVAIL) {
     // Error available - read it
     struct fi_cq_err_entry err_entry;
