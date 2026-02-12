@@ -391,27 +391,14 @@ impl CppStaticLibsConfig {
         }
 
         // Link libfabric statically for EFA support.
-        // Try DEP_RDMAXCEL_LIBFABRIC_A from rdmaxcel-sys metadata first,
-        // then fall back to searching the rdmaxcel-sys build output.
-        let libfabric_a = std::env::var("DEP_RDMAXCEL_LIBFABRIC_A").ok()
-            .or_else(|| {
-                let manifest = std::env::var("CARGO_MANIFEST_DIR").ok()?;
-                let path = format!("{}/../rdmaxcel-sys/target/libfabric_build/libfabric-install/lib/libfabric.a", manifest);
-                if std::path::Path::new(&path).exists() {
-                    Some(std::fs::canonicalize(&path).ok()?.to_string_lossy().to_string())
-                } else {
-                    None
-                }
-            });
+        // Path is exported by rdmaxcel-sys via cargo:metadata=LIBFABRIC_A=...
+        let libfabric_a = std::env::var("DEP_RDMAXCEL_LIBFABRIC_A")
+            .expect("DEP_RDMAXCEL_LIBFABRIC_A not set - rdmaxcel-sys must build libfabric");
 
-        if let Some(path) = libfabric_a {
-            if std::path::Path::new(&path).exists() {
-                println!("cargo:warning=Linking libfabric from {}", path);
-                println!("cargo:rustc-link-arg=-Wl,--whole-archive");
-                println!("cargo:rustc-link-arg={}", path);
-                println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
-            }
-        }
+        println!("cargo:warning=Linking libfabric from {}", libfabric_a);
+        println!("cargo:rustc-link-arg=-Wl,--whole-archive");
+        println!("cargo:rustc-link-arg={}", libfabric_a);
+        println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
     }
 }
 
