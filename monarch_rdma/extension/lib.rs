@@ -128,6 +128,16 @@ unsafe extern "C" fn pytorch_segment_scanner(
     }
 }
 
+/// Dispatch on BufferInner when both arms use the same field names.
+macro_rules! with_buffer {
+    ($inner:expr, $field:ident, $body:expr) => {
+        match $inner {
+            BufferInner::Ibverbs { $field, .. } => $body,
+            BufferInner::Efa { $field, .. } => $body,
+        }
+    };
+}
+
 /// Internal buffer representation — either ibverbs or EFA backend.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "backend")]
@@ -225,10 +235,7 @@ impl PyRdmaBuffer {
 
     #[pyo3(name = "__repr__")]
     fn repr(&self) -> String {
-        match &self.inner {
-            BufferInner::Ibverbs { buffer, .. } => format!("<RdmaBuffer'{:?}'>", buffer),
-            BufferInner::Efa { buffer, .. } => format!("<RdmaBuffer'{:?}'>", buffer),
-        }
+        with_buffer!(&self.inner, buffer, format!("<RdmaBuffer'{:?}'>", buffer))
     }
 
     /// Reads data from the local buffer and places it into this remote RDMA buffer.
@@ -387,35 +394,18 @@ impl PyRdmaBuffer {
         local_proc_id: String,
         client: PyInstance,
     ) -> PyResult<PyPythonTask> {
-        match &self.inner {
-            BufferInner::Ibverbs { buffer, .. } => {
-                let buffer = buffer.clone();
-                PyPythonTask::new(async move {
-                    buffer
-                        .drop_buffer(client.deref())
-                        .await
-                        .map_err(|e| PyException::new_err(format!("Failed to drop buffer: {}", e)))?;
-                    Ok(())
-                })
-            }
-            BufferInner::Efa { buffer, .. } => {
-                let buffer = buffer.clone();
-                PyPythonTask::new(async move {
-                    buffer
-                        .drop_buffer(client.deref())
-                        .await
-                        .map_err(|e| PyException::new_err(format!("Failed to drop buffer: {}", e)))?;
-                    Ok(())
-                })
-            }
-        }
+        let buffer = with_buffer!(&self.inner, buffer, buffer.clone());
+        PyPythonTask::new(async move {
+            buffer
+                .drop_buffer(client.deref())
+                .await
+                .map_err(|e| PyException::new_err(format!("Failed to drop buffer: {}", e)))?;
+            Ok(())
+        })
     }
 
     fn owner_actor_id(&self) -> String {
-        match &self.inner {
-            BufferInner::Ibverbs { owner_ref, .. } => owner_ref.actor_id().to_string(),
-            BufferInner::Efa { owner_ref, .. } => owner_ref.actor_id().to_string(),
-        }
+        with_buffer!(&self.inner, owner_ref, owner_ref.actor_id().to_string())
     }
 }
 
