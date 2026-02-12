@@ -394,14 +394,24 @@ impl PyRdmaBuffer {
         local_proc_id: String,
         client: PyInstance,
     ) -> PyResult<PyPythonTask> {
-        let buffer = with_buffer!(&self.inner, buffer, buffer.clone());
-        PyPythonTask::new(async move {
-            buffer
-                .drop_buffer(client.deref())
-                .await
-                .map_err(|e| PyException::new_err(format!("Failed to drop buffer: {}", e)))?;
-            Ok(())
-        })
+        match &self.inner {
+            BufferInner::Ibverbs { buffer, .. } => {
+                let buffer = buffer.clone();
+                PyPythonTask::new(async move {
+                    buffer.drop_buffer(client.deref()).await
+                        .map_err(|e| PyException::new_err(format!("Failed to drop buffer: {}", e)))?;
+                    Ok(())
+                })
+            }
+            BufferInner::Efa { buffer, .. } => {
+                let buffer = buffer.clone();
+                PyPythonTask::new(async move {
+                    buffer.drop_buffer(client.deref()).await
+                        .map_err(|e| PyException::new_err(format!("Failed to drop buffer: {}", e)))?;
+                    Ok(())
+                })
+            }
+        }
     }
 
     fn owner_actor_id(&self) -> String {
