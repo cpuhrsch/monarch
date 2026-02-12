@@ -340,22 +340,14 @@ impl EfaManagerMessageHandler for EfaManagerActor {
             fi_addr
         };
 
-        // Push data to dest and send completion notification.
-        // Retries with async yields between batches to keep heartbeats alive.
-        loop {
-            match endpoint.push_data(
-                local_mr.addr, size,
-                remote_buffer.mr_addr as u64, remote_buffer.mr_key,
-                peer, tag, POLL_SPINS_PER_BATCH,
-            ) {
-                Ok(()) => break,
-                Err(e) if e.code == -13 => { // EFA_ERROR_TIMEOUT = poll spins exhausted
-                    async_yield_now().await;
-                    continue;
-                }
-                Err(e) => return Err(anyhow::anyhow!("Failed to push data: {}", e)),
-            }
-        }
+        // Push data to dest and send completion notification (all in C, spins until done)
+        endpoint.push_data(
+            local_mr.addr, size,
+            remote_buffer.mr_addr as u64, remote_buffer.mr_key,
+            peer, tag, 0,
+        ).map_err(|e| {
+            anyhow::anyhow!("Failed to push data: {}", e)
+        })?;
 
         Ok(true)
     }
