@@ -20,7 +20,8 @@ use rdmaxcel_sys::{
     rdmaxcel_efa_error_string, rdmaxcel_efa_get_local_addr,
     rdmaxcel_efa_insert_peer_addr,
     rdmaxcel_efa_register_mr,
-    rdmaxcel_efa_push_data, rdmaxcel_efa_wait_for_data,
+    rdmaxcel_efa_post_write, rdmaxcel_efa_post_tsend, rdmaxcel_efa_post_trecv,
+    rdmaxcel_efa_poll_cq,
 };
 
 const EFA_SUCCESS: i32 = 0;
@@ -167,16 +168,26 @@ impl EfaEndpoint {
         efa_call!(rdmaxcel_efa_deregister_mr(self.ep, key))
     }
 
-    /// Push data to a remote peer: fi_write + poll + fi_tsend + poll.
-    /// The destination must call wait_for_data with the same tag.
-    pub fn push_data(&self, local_addr: usize, size: usize, remote_addr: u64, remote_key: u64, peer: u64, tag: u64, max_poll_spins: i32) -> EfaResult<()> {
-        efa_call!(rdmaxcel_efa_push_data(self.ep, local_addr as *mut _, size, remote_addr, remote_key, peer, tag, max_poll_spins))
+    pub fn post_write(&self, local_addr: usize, size: usize, remote_addr: u64, remote_key: u64, peer: u64) -> EfaResult<()> {
+        efa_call!(rdmaxcel_efa_post_write(self.ep, local_addr as *mut _, size, remote_addr, remote_key, peer))
     }
 
-    /// Wait for data from a remote peer: fi_trecv + poll.
-    /// The source must call push_data with the same tag.
-    pub fn wait_for_data(&self, tag: u64, max_poll_spins: i32) -> EfaResult<()> {
-        efa_call!(rdmaxcel_efa_wait_for_data(self.ep, tag, max_poll_spins))
+    pub fn post_tsend(&self, tag: u64, peer: u64) -> EfaResult<()> {
+        efa_call!(rdmaxcel_efa_post_tsend(self.ep, tag, peer))
+    }
+
+    pub fn post_trecv(&self, tag: u64) -> EfaResult<()> {
+        efa_call!(rdmaxcel_efa_post_trecv(self.ep, tag))
+    }
+
+    /// Poll completion queue, spinning for up to max_spins iterations.
+    /// Returns number of completions (>0), 0 if none after max_spins.
+    pub fn poll_cq(&self, max_spins: i32) -> EfaResult<i32> {
+        let ret = unsafe { rdmaxcel_efa_poll_cq(self.ep, max_spins) };
+        if ret < 0 {
+            return Err(EfaError::from(ret));
+        }
+        Ok(ret)
     }
 }
 

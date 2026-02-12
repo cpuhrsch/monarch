@@ -433,63 +433,38 @@ static int poll_cq(rdmaxcel_efa_ep_t* ep, int max_spins) {
   return 0;
 }
 
-int rdmaxcel_efa_push_data(
+int rdmaxcel_efa_post_write(
     rdmaxcel_efa_ep_t* ep,
     void* local_addr,
     size_t size,
     uint64_t remote_addr,
     uint64_t remote_key,
-    uint64_t peer,
-    uint64_t tag,
-    int max_poll_spins) {
+    uint64_t peer) {
   if (!ep || !local_addr || size == 0) {
     return EFA_ERROR_INVALID_PARAMS;
   }
-
   void* desc = find_mr_desc(ep, local_addr);
   if (!desc) {
-    EFA_DEBUG("[EFA] push_data: no MR found covering local_addr=%p\n", local_addr);
+    EFA_DEBUG("[EFA] post_write: no MR found covering local_addr=%p\n", local_addr);
     return EFA_ERROR_INVALID_PARAMS;
   }
-
-  fi_addr_t fi_peer = static_cast<fi_addr_t>(peer);
-
-  // Step 1: Post fi_write
-  int ret = post_write(ep, local_addr, size, desc, fi_peer, remote_addr, remote_key);
-  if (ret != EFA_SUCCESS) return ret;
-
-  // Step 2: Poll for write completion
-  int completions = poll_cq(ep, max_poll_spins);
-  if (completions <= 0) return (completions < 0) ? completions : EFA_ERROR_TIMEOUT;
-
-  // Step 3: Send completion notification
-  ret = post_tsend(ep, tag, fi_peer);
-  if (ret != EFA_SUCCESS) return ret;
-
-  // Step 4: Poll for tsend completion
-  completions = poll_cq(ep, max_poll_spins);
-  if (completions <= 0) return (completions < 0) ? completions : EFA_ERROR_TIMEOUT;
-
-  return EFA_SUCCESS;
+  return post_write(ep, local_addr, size, desc, static_cast<fi_addr_t>(peer),
+                    remote_addr, remote_key);
 }
 
-int rdmaxcel_efa_wait_for_data(
-    rdmaxcel_efa_ep_t* ep,
-    uint64_t tag,
-    int max_poll_spins) {
-  if (!ep) {
-    return EFA_ERROR_INVALID_PARAMS;
-  }
+int rdmaxcel_efa_post_tsend(rdmaxcel_efa_ep_t* ep, uint64_t tag, uint64_t peer) {
+  if (!ep) return EFA_ERROR_INVALID_PARAMS;
+  return post_tsend(ep, tag, static_cast<fi_addr_t>(peer));
+}
 
-  // Step 1: Post trecv
-  int ret = post_trecv(ep, tag);
-  if (ret != EFA_SUCCESS) return ret;
+int rdmaxcel_efa_post_trecv(rdmaxcel_efa_ep_t* ep, uint64_t tag) {
+  if (!ep) return EFA_ERROR_INVALID_PARAMS;
+  return post_trecv(ep, tag);
+}
 
-  // Step 2: Poll for trecv completion (also drives fi_write progress)
-  int completions = poll_cq(ep, max_poll_spins);
-  if (completions <= 0) return (completions < 0) ? completions : EFA_ERROR_TIMEOUT;
-
-  return EFA_SUCCESS;
+int rdmaxcel_efa_poll_cq(rdmaxcel_efa_ep_t* ep, int max_spins) {
+  if (!ep) return EFA_ERROR_INVALID_PARAMS;
+  return poll_cq(ep, max_spins);
 }
 
 const char* rdmaxcel_efa_error_string(int error_code) {

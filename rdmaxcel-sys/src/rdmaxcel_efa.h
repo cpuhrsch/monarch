@@ -97,39 +97,31 @@ int rdmaxcel_efa_deregister_mr(
     rdmaxcel_efa_ep_t* ep,
     uint64_t key);
 
-// Push data to a remote peer: fi_write + poll + fi_tsend + poll
-// This is the source-side operation. The destination must call wait_for_data.
-// Parameters:
-//   ep: EFA endpoint
-//   local_addr: Local buffer address to write from
-//   size: Size of data to write
-//   remote_addr: Remote memory address to write to
-//   remote_key: Remote memory registration key
-//   peer: Peer fi_addr_t handle from rdmaxcel_efa_insert_peer_addr
-//   tag: Tag for completion notification (must match dest's wait_for_data)
-//   max_poll_spins: Max fi_cq_read spins per poll phase (0 = unlimited)
-// Returns: EFA_SUCCESS on success, error code on failure
-int rdmaxcel_efa_push_data(
+// Post an RDMA write (returns immediately, does not wait for completion)
+int rdmaxcel_efa_post_write(
     rdmaxcel_efa_ep_t* ep,
     void* local_addr,
     size_t size,
     uint64_t remote_addr,
     uint64_t remote_key,
-    uint64_t peer,
-    uint64_t tag,
-    int max_poll_spins);
+    uint64_t peer);
 
-// Wait for data from a remote peer: fi_trecv + poll
-// This is the destination-side operation. The source must call push_data.
-// Parameters:
-//   ep: EFA endpoint
-//   tag: Expected tag (must match source's push_data tag)
-//   max_poll_spins: Max fi_cq_read spins per poll phase (0 = unlimited)
-// Returns: EFA_SUCCESS on success, error code on failure
-int rdmaxcel_efa_wait_for_data(
+// Post a tagged send for completion notification (returns immediately)
+int rdmaxcel_efa_post_tsend(
     rdmaxcel_efa_ep_t* ep,
     uint64_t tag,
-    int max_poll_spins);
+    uint64_t peer);
+
+// Post a tagged receive for completion notification (returns immediately)
+int rdmaxcel_efa_post_trecv(
+    rdmaxcel_efa_ep_t* ep,
+    uint64_t tag);
+
+// Poll completion queue, spinning for up to max_spins iterations
+// Returns: >0 completions, 0 if none after max_spins, <0 on error
+int rdmaxcel_efa_poll_cq(
+    rdmaxcel_efa_ep_t* ep,
+    int max_spins);
 
 // Get error string for EFA error code
 const char* rdmaxcel_efa_error_string(int error_code);
