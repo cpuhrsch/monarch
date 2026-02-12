@@ -380,7 +380,7 @@ impl CppStaticLibsConfig {
         }
     }
 
-    /// Emit all cargo link directives for static linking of rdma-core.
+    /// Emit all cargo link directives for static linking of rdma-core and libfabric.
     ///
     /// This uses direct paths to the .a files we built, avoiding any path ordering
     /// issues where the linker might find system libraries or libraries built with
@@ -388,6 +388,29 @@ impl CppStaticLibsConfig {
     pub fn emit_link_directives(&self) {
         for lib_path in &self.rdma_static_libraries {
             println!("cargo::rustc-link-arg={}", lib_path);
+        }
+
+        // Link libfabric statically for EFA support.
+        // Try DEP_RDMAXCEL_LIBFABRIC_A from rdmaxcel-sys metadata first,
+        // then fall back to searching the rdmaxcel-sys build output.
+        let libfabric_a = std::env::var("DEP_RDMAXCEL_LIBFABRIC_A").ok()
+            .or_else(|| {
+                let manifest = std::env::var("CARGO_MANIFEST_DIR").ok()?;
+                let path = format!("{}/../rdmaxcel-sys/target/libfabric_build/libfabric-install/lib/libfabric.a", manifest);
+                if std::path::Path::new(&path).exists() {
+                    Some(std::fs::canonicalize(&path).ok()?.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            });
+
+        if let Some(path) = libfabric_a {
+            if std::path::Path::new(&path).exists() {
+                println!("cargo:warning=Linking libfabric from {}", path);
+                println!("cargo:rustc-link-arg=-Wl,--whole-archive");
+                println!("cargo:rustc-link-arg={}", path);
+                println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
+            }
         }
     }
 }
