@@ -26,7 +26,12 @@ use monarch_rdma::RdmaManagerActor;
 use monarch_rdma::RdmaManagerMessageClient;
 use monarch_rdma::efa_manager_actor::EfaManagerMessageClient;
 use monarch_rdma::efa_supported;
-use monarch_rdma::rdma_supported;
+use monarch_rdma::rdma_supported as ibverbs_supported;
+
+/// RDMA is supported if either ibverbs or EFA is available.
+fn rdma_supported() -> bool {
+    ibverbs_supported() || efa_supported()
+}
 use monarch_rdma::register_segment_scanner;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyException;
@@ -179,7 +184,7 @@ impl PyRdmaBuffer {
         proc_id: String,
         client: PyInstance,
     ) -> PyResult<PyPythonTask> {
-        if !rdma_supported() && !efa_supported() {
+        if !rdma_supported() {
             return Err(PyException::new_err("RDMA is not supported on this system"));
         }
         PyPythonTask::new(create_rdma_buffer(
@@ -199,7 +204,7 @@ impl PyRdmaBuffer {
         proc_id: String,
         client: PyInstance,
     ) -> PyResult<PyRdmaBuffer> {
-        if !rdma_supported() && !efa_supported() {
+        if !rdma_supported() {
             return Err(PyException::new_err("RDMA is not supported on this system"));
         }
         signal_safe_block_on(
@@ -210,7 +215,7 @@ impl PyRdmaBuffer {
 
     #[classmethod]
     fn rdma_supported<'py>(_cls: &Bound<'_, PyType>, _py: Python<'py>) -> bool {
-        rdma_supported() || efa_supported()
+        rdma_supported()
     }
 
     #[classmethod]
