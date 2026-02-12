@@ -48,6 +48,58 @@ def test_get_rdma_backend_returns_valid_string():
     assert result in ("ibverbs", "efa", "none")
 
 
+def test_memoryview_from_bytearray():
+    """memoryview from bytearray should produce valid addr and size."""
+    from monarch._src.rdma.rdma import _get_addr_and_size
+
+    buf = bytearray(4096)
+    mv = memoryview(buf)
+    addr, size = _get_addr_and_size(mv)
+    assert size == 4096
+    assert addr > 0
+
+
+def test_memoryview_from_mmap():
+    """memoryview from mmap'd anonymous memory should produce valid addr and size."""
+    import mmap
+
+    from monarch._src.rdma.rdma import _get_addr_and_size
+
+    # Anonymous mmap — pages are zero-filled and faulted on access
+    mm = mmap.mmap(-1, 4096)
+    mv = memoryview(mm)
+    addr, size = _get_addr_and_size(mv)
+    assert size == 4096
+    assert addr > 0
+    mm.close()
+
+
+def test_memoryview_from_mmap_unfaulted():
+    """Large mmap'd region where pages may not be faulted until touched."""
+    import mmap
+
+    from monarch._src.rdma.rdma import _get_addr_and_size
+
+    # 1MB anonymous mmap — OS may not fault all pages until accessed
+    mm = mmap.mmap(-1, 1024 * 1024)
+    mv = memoryview(mm)
+    addr, size = _get_addr_and_size(mv)
+    assert size == 1024 * 1024
+    assert addr > 0
+    mm.close()
+
+
+def test_memoryview_rejects_non_contiguous():
+    """Non-contiguous memoryview should be rejected."""
+    from monarch._src.rdma.rdma import _assert_1d_contiguous
+
+    buf = bytearray(100)
+    mv = memoryview(buf)
+    # Slice with step makes it non-contiguous
+    with pytest.raises(ValueError):
+        _assert_1d_contiguous(mv[::2])
+
+
 # ---------------------------------------------------------------------------
 # RDMA tests (require hardware)
 # ---------------------------------------------------------------------------
