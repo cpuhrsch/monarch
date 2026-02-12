@@ -51,7 +51,7 @@ use crate::efa_primitives::EfaEndpoint;
 use crate::efa_components::EfaBuffer;
 use crate::efa_supported;
 
-const POLL_SPINS_PER_BATCH: i32 = 100_000;
+const POLL_SPINS_PER_BATCH: i32 = 10_000_000;
 
 /// Yield control back to the async runtime, allowing other tasks
 /// (including hyperactor session heartbeats) to make progress.
