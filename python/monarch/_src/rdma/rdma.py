@@ -265,7 +265,7 @@ class RDMABuffer:
             if size == 0:
                 raise ValueError("Cannot create RDMABuffer with size 0.")
             ctx = context()
-            self._buffer = _RdmaBuffer.create_rdma_buffer_blocking(
+            self._buffer: _RdmaBuffer = _RdmaBuffer.create_rdma_buffer_blocking(
                 addr=addr,
                 size=size,
                 proc_id=ctx.actor_instance.proc_id,
