@@ -26,7 +26,6 @@ fn run_cmd(cmd: &mut std::process::Command) -> Result<(), String> {
 
 /// Build libfabric from source and return (include_dir, lib_dir).
 /// Caches the build at rdmaxcel-sys/target/libfabric_build/.
-/// Returns None if the build fails (EFA will be disabled).
 #[cfg(not(target_os = "macos"))]
 fn build_libfabric() -> Option<(String, String)> {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
@@ -354,56 +353,49 @@ fn main() {
 
                 // Compile EFA support with libfabric built from source
                 let efa_cpp_path = format!("{}/src/rdmaxcel_efa.cpp", manifest_dir);
-                if Path::new(&efa_cpp_path).exists() {
-                    println!("cargo:rerun-if-env-changed=MONARCH_LIBFABRIC_TAG");
-                    println!("cargo:rerun-if-changed={}", efa_cpp_path);
-                    println!(
-                        "cargo:rerun-if-changed={}/src/rdmaxcel_efa.h",
-                        manifest_dir
-                    );
+                println!("cargo:rerun-if-env-changed=MONARCH_LIBFABRIC_TAG");
+                println!("cargo:rerun-if-changed={}", efa_cpp_path);
+                println!(
+                    "cargo:rerun-if-changed={}/src/rdmaxcel_efa.h",
+                    manifest_dir
+                );
 
-                    // Build or locate libfabric
-                    let (libfabric_include, libfabric_lib_dir) = build_libfabric()
-                        .expect("Failed to build libfabric. EFA support requires libfabric.");
+                let (libfabric_include, libfabric_lib_dir) = build_libfabric()
+                    .expect("Failed to build libfabric. EFA support requires libfabric.");
 
-                    // Compile rdmaxcel_efa.cpp
-                    let mut efa_build = cc::Build::new();
-                    efa_build
-                        .file(&efa_cpp_path)
-                        .include(format!("{}/src", manifest_dir))
-                        .include(&libfabric_include)
-                        .flag("-fPIC")
-                        .cpp(true)
-                        .flag("-std=c++14");
+                let mut efa_build = cc::Build::new();
+                efa_build
+                    .file(&efa_cpp_path)
+                    .include(format!("{}/src", manifest_dir))
+                    .include(&libfabric_include)
+                    .flag("-fPIC")
+                    .cpp(true)
+                    .flag("-std=c++14");
 
-                    efa_build.compile("rdmaxcel_efa");
+                efa_build.compile("rdmaxcel_efa");
 
-                        // Export libfabric path via metadata so the final
-                        // cdylib crate (monarch_extension) can link it.
-                        // cargo:rustc-link-arg from a lib crate does NOT
-                        // propagate to the cdylib link step.
-                        let libfabric_a = format!("{}/libfabric.a", libfabric_lib_dir);
-                        println!("cargo:metadata=LIBFABRIC_A={}", libfabric_a);
+                // Export libfabric path via metadata so the final
+                // cdylib crate (monarch_extension) can link it.
+                // cargo:rustc-link-arg from a lib crate does NOT
+                // propagate to the cdylib link step.
+                let libfabric_a = format!("{}/libfabric.a", libfabric_lib_dir);
+                println!("cargo:metadata=LIBFABRIC_A={}", libfabric_a);
 
-                        // Link libfabric's private dependencies
-                        // (ibverbs + efa are already linked by monarch_cpp_static_libs)
-                        // (rt, pthread, dl are already linked earlier for cudart_static)
-                        println!("cargo:rustc-link-lib=numa");
-                        println!("cargo:rustc-link-lib=uuid");
-                        println!("cargo:rustc-link-lib=hwloc");
-                        println!("cargo:rustc-link-lib=rdmacm");
-                        println!("cargo:rustc-link-lib=nl-3");
-                        println!("cargo:rustc-link-lib=nl-route-3");
-                        println!("cargo:rustc-link-lib=atomic");
+                // Link libfabric's private dependencies
+                // (ibverbs + efa are already linked by monarch_cpp_static_libs)
+                // (rt, pthread, dl are already linked earlier for cudart_static)
+                println!("cargo:rustc-link-lib=numa");
+                println!("cargo:rustc-link-lib=uuid");
+                println!("cargo:rustc-link-lib=hwloc");
+                println!("cargo:rustc-link-lib=rdmacm");
+                println!("cargo:rustc-link-lib=nl-3");
+                println!("cargo:rustc-link-lib=nl-route-3");
+                println!("cargo:rustc-link-lib=atomic");
 
-                        println!("cargo:rustc-cfg=feature=\"efa\"");
-                        println!("cargo:rustc-check-cfg=cfg(feature, values(\"efa\"))");
-
-                        println!(
-                            "cargo:warning=Statically linked libfabric from {}",
-                            libfabric_lib_dir
-                        );
-                }
+                println!(
+                    "cargo:warning=Statically linked libfabric from {}",
+                    libfabric_lib_dir
+                );
             } else {
                 if !Path::new(&cpp_source_path).exists() {
                     panic!("C++ source file not found at {}", cpp_source_path);
