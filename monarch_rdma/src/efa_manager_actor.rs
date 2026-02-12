@@ -51,36 +51,6 @@ use crate::efa_primitives::EfaEndpoint;
 use crate::efa_components::EfaBuffer;
 use crate::efa_supported;
 
-/// Max fi_cq_read spins per C-side poll phase.
-/// After this many spins, the C call returns 0 (no completion yet),
-/// and the Rust actor yields to the async runtime before retrying.
-const POLL_SPINS_PER_BATCH: i32 = 100_000;
-
-/// Yield control back to the async runtime, allowing other tasks
-/// (including hyperactor session heartbeats) to make progress.
-async fn async_yield_now() {
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-
-    struct YieldNow(bool);
-
-    impl Future for YieldNow {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            if self.0 {
-                Poll::Ready(())
-            } else {
-                self.0 = true;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
-
-    YieldNow(false).await
-}
-
 /// Messages handled by EfaManagerActor
 #[derive(Handler, HandleClient, RefClient, Debug, Serialize, Deserialize, Named)]
 pub enum EfaManagerMessage {
