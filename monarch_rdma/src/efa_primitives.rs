@@ -178,10 +178,6 @@ impl EfaEndpoint {
     pub fn wait_for_data(&self, tag: u64, max_poll_spins: i32) -> EfaResult<()> {
         efa_call!(rdmaxcel_efa_wait_for_data(self.ep, tag, max_poll_spins))
     }
-
-    pub unsafe fn as_raw(&self) -> *mut rdmaxcel_efa_ep_t {
-        self.ep
-    }
 }
 
 impl Drop for EfaEndpoint {
