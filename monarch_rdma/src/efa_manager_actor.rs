@@ -51,63 +51,9 @@ use crate::efa_primitives::EfaEndpoint;
 use crate::efa_components::EfaBuffer;
 use crate::efa_supported;
 
-/// Yield control back to the async runtime, allowing other tasks
-/// (including hyperactor session heartbeats) to make progress.
-///
-/// This is equivalent to `tokio::task::yield_now()` but uses only
-/// `std::future` primitives to avoid a direct tokio dependency.
-async fn async_yield_now() {
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-
-    struct YieldNow(bool);
-
-    impl Future for YieldNow {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            if self.0 {
-                Poll::Ready(())
-            } else {
-                self.0 = true;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
-
-    YieldNow(false).await
-}
-
-/// Poll the EFA completion queue with spin-polling and async yielding.
-///
-/// Each call to poll_cq spins for SPINS_PER_POLL iterations in C (tight loop,
-/// no FFI overhead per spin). Between batches, yields to the async runtime
-/// to allow other tasks (like hyperactor session heartbeats) to make progress.
-/// Gives up after MAX_POLL_ATTEMPTS batches.
-async fn poll_for_completion(
-    endpoint: &EfaEndpoint,
-    operation: &str,
-) -> Result<i32, anyhow::Error> {
-    const SPINS_PER_POLL: i32 = 10_000;
-    const MAX_POLL_ATTEMPTS: u32 = 100_000;
-
-    for _ in 0..MAX_POLL_ATTEMPTS {
-        let completions = endpoint.poll_cq(SPINS_PER_POLL).map_err(|e| {
-            anyhow::anyhow!("Failed to poll for {} completion: {}", operation, e)
-        })?;
-        if completions > 0 {
-            return Ok(completions);
-        }
-        async_yield_now().await;
-    }
-
-    Err(anyhow::anyhow!(
-        "Timeout waiting for {} completion after {} attempts",
-        operation,
-        MAX_POLL_ATTEMPTS,
-    ))
-}
+/// Max fi_cq_read spins per poll phase in push_data/wait_for_data.
+/// 0 = unlimited (spin until completion or error).
+const MAX_POLL_SPINS: i32 = 0;
 
 /// Messages handled by EfaManagerActor
 #[derive(Handler, HandleClient, RefClient, Debug, Serialize, Deserialize, Named)]
@@ -398,27 +344,18 @@ impl EfaManagerMessageHandler for EfaManagerActor {
             fi_addr
         };
 
-        // fi_write: push FROM our local data TO dest's recv buffer
-        endpoint.write(
+        // Push data to dest and send completion notification (all in C)
+        endpoint.push_data(
             local_mr.addr,
             size,
             remote_buffer.mr_addr as u64,
             remote_buffer.mr_key,
             peer,
+            tag,
+            MAX_POLL_SPINS,
         ).map_err(|e| {
-            anyhow::anyhow!("Failed to perform EFA write: {}", e)
+            anyhow::anyhow!("Failed to push data: {}", e)
         })?;
-
-        // Poll for write completion
-        poll_for_completion(endpoint, "write").await?;
-
-        // Send completion notification to dest
-        endpoint.tsend(tag, peer).map_err(|e| {
-            anyhow::anyhow!("Failed to send completion notification: {}", e)
-        })?;
-
-        // Poll for tsend completion
-        poll_for_completion(endpoint, "tsend").await?;
 
         Ok(true)
     }
@@ -446,12 +383,10 @@ impl EfaManagerMessageHandler for EfaManagerActor {
             self.known_peers.insert(remote_buffer.endpoint_addr.clone(), fi_addr);
         }
 
-        // Post trecv and poll for source's completion notification
-        endpoint.trecv(notification_tag).map_err(|e| {
-            anyhow::anyhow!("Failed to post trecv: {}", e)
+        // Wait for source's data push and completion notification (all in C)
+        endpoint.wait_for_data(notification_tag, MAX_POLL_SPINS).map_err(|e| {
+            anyhow::anyhow!("Failed to wait for data: {}", e)
         })?;
-
-        poll_for_completion(endpoint, "trecv").await?;
 
         Ok(())
     }

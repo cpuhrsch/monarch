@@ -97,66 +97,39 @@ int rdmaxcel_efa_deregister_mr(
     rdmaxcel_efa_ep_t* ep,
     uint64_t key);
 
-// Perform RDMA write operation
+// Push data to a remote peer: fi_write + poll + fi_tsend + poll
+// This is the source-side operation. The destination must call wait_for_data.
 // Parameters:
 //   ep: EFA endpoint
-//   local_addr: Local buffer address
+//   local_addr: Local buffer address to write from
 //   size: Size of data to write
-//   remote_addr: Remote memory address
+//   remote_addr: Remote memory address to write to
 //   remote_key: Remote memory registration key
 //   peer: Peer fi_addr_t handle from rdmaxcel_efa_insert_peer_addr
+//   tag: Tag for completion notification (must match dest's wait_for_data)
+//   max_poll_spins: Max fi_cq_read spins per poll phase (0 = unlimited)
 // Returns: EFA_SUCCESS on success, error code on failure
-int rdmaxcel_efa_write(
+int rdmaxcel_efa_push_data(
     rdmaxcel_efa_ep_t* ep,
     void* local_addr,
     size_t size,
     uint64_t remote_addr,
     uint64_t remote_key,
-    uint64_t peer);
+    uint64_t peer,
+    uint64_t tag,
+    int max_poll_spins);
 
-// Perform RDMA read operation
+// Wait for data from a remote peer: fi_trecv + poll
+// This is the destination-side operation. The source must call push_data.
 // Parameters:
 //   ep: EFA endpoint
-//   local_addr: Local buffer address to read into
-//   size: Size of data to read
-//   remote_addr: Remote memory address
-//   remote_key: Remote memory registration key
-//   peer: Peer fi_addr_t handle from rdmaxcel_efa_insert_peer_addr
+//   tag: Expected tag (must match source's push_data tag)
+//   max_poll_spins: Max fi_cq_read spins per poll phase (0 = unlimited)
 // Returns: EFA_SUCCESS on success, error code on failure
-int rdmaxcel_efa_read(
-    rdmaxcel_efa_ep_t* ep,
-    void* local_addr,
-    size_t size,
-    uint64_t remote_addr,
-    uint64_t remote_key,
-    uint64_t peer);
-
-// Poll for completion of RDMA operations (non-blocking, spin for up to max_spins)
-// Parameters:
-//   ep: EFA endpoint
-//   max_spins: Maximum number of fi_cq_read attempts before returning
-// Returns: Number of completions (>0), 0 if none after max_spins, negative error code on failure
-int rdmaxcel_efa_poll_cq(rdmaxcel_efa_ep_t* ep, int max_spins);
-
-// Send a tagged message (for completion notification)
-// Parameters:
-//   ep: EFA endpoint
-//   tag: Message tag (used to match with trecv)
-//   peer: Peer fi_addr_t handle from rdmaxcel_efa_insert_peer_addr
-// Returns: EFA_SUCCESS on success, error code on failure
-int rdmaxcel_efa_tsend(
+int rdmaxcel_efa_wait_for_data(
     rdmaxcel_efa_ep_t* ep,
     uint64_t tag,
-    uint64_t peer);
-
-// Post a tagged receive (for completion notification)
-// Parameters:
-//   ep: EFA endpoint
-//   tag: Expected message tag
-// Returns: EFA_SUCCESS on success, error code on failure
-int rdmaxcel_efa_trecv(
-    rdmaxcel_efa_ep_t* ep,
-    uint64_t tag);
+    int max_poll_spins);
 
 // Get error string for EFA error code
 const char* rdmaxcel_efa_error_string(int error_code);

@@ -8,6 +8,7 @@
 
 #include "rdmaxcel_efa.h"
 
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -333,143 +334,85 @@ int rdmaxcel_efa_deregister_mr(rdmaxcel_efa_ep_t* ep, uint64_t key) {
   return EFA_ERROR_INVALID_PARAMS;
 }
 
-int rdmaxcel_efa_write(
-    rdmaxcel_efa_ep_t* ep,
-    void* local_addr,
-    size_t size,
-    uint64_t remote_addr,
-    uint64_t remote_key,
-    uint64_t peer) {
-  if (!ep || !local_addr || size == 0) {
-    return EFA_ERROR_INVALID_PARAMS;
-  }
-
-  // Find local MR for descriptor - must match the address being written from
-  void* desc = nullptr;
+// Find the cached MR descriptor for a local address
+static void* find_mr_desc(rdmaxcel_efa_ep_t* ep, void* local_addr) {
   uintptr_t addr_val = reinterpret_cast<uintptr_t>(local_addr);
   for (auto& pair : ep->registered_mrs) {
     const mr_info& info = pair.second;
     if (addr_val >= info.addr && addr_val < info.addr + info.size) {
-      desc = info.desc;
-      break;
+      return info.desc;
     }
   }
-  if (!desc) {
-    EFA_DEBUG("[EFA] write: no MR found covering local_addr=%p (have %zu MRs)\n",
-            local_addr, ep->registered_mrs.size());
-    if (efa_debug_enabled()) {
-      for (auto& pair : ep->registered_mrs) {
-        fprintf(stderr, "  MR key=%lu addr=0x%lx size=%zu\n",
-                (unsigned long)pair.first, (unsigned long)pair.second.addr, pair.second.size);
-      }
-    }
-    return EFA_ERROR_INVALID_PARAMS;
-  }
+  return nullptr;
+}
 
-  fi_addr_t fi_peer = static_cast<fi_addr_t>(peer);
-  EFA_DEBUG("[EFA] write: local_addr=%p, size=%zu, remote_addr=0x%lx, remote_key=%lu, peer=%lu, num_mrs=%zu\n",
-          local_addr, size, (unsigned long)remote_addr, (unsigned long)remote_key,
-          (unsigned long)fi_peer, ep->registered_mrs.size());
-
-  // Post write with retry on EAGAIN
+// Post an fi_write with EAGAIN retry
+static int post_write(
+    rdmaxcel_efa_ep_t* ep,
+    void* local_addr,
+    size_t size,
+    void* desc,
+    fi_addr_t peer,
+    uint64_t remote_addr,
+    uint64_t remote_key) {
   for (int retries = 0; retries < 100000; retries++) {
-    ssize_t ret = fi_write(
-        ep->ep,
-        local_addr,
-        size,
-        desc,
-        fi_peer,
-        remote_addr,
-        remote_key,
-        nullptr);
-
-    if (ret == 0) {
-      EFA_DEBUG("[EFA] write: fi_write succeeded\n");
-      return EFA_SUCCESS;
-    } else if (ret == -FI_EAGAIN) {
-      // Resource temporarily unavailable, poll CQ and retry
+    ssize_t ret = fi_write(ep->ep, local_addr, size, desc, peer,
+                           remote_addr, remote_key, nullptr);
+    if (ret == 0) return EFA_SUCCESS;
+    if (ret == -FI_EAGAIN) {
       struct fi_cq_tagged_entry entry;
       fi_cq_read(ep->cq, &entry, 1);
       continue;
-    } else {
-      EFA_DEBUG("[EFA] write: fi_write FAILED with ret=%zd (%s)\n", ret, fi_strerror(-ret));
-      print_fi_error("fi_write failed", static_cast<int>(ret));
-      return EFA_ERROR_WRITE_FAILED;
     }
+    print_fi_error("fi_write failed", static_cast<int>(ret));
+    return EFA_ERROR_WRITE_FAILED;
   }
-
   return EFA_ERROR_WRITE_FAILED;
 }
 
-int rdmaxcel_efa_read(
-    rdmaxcel_efa_ep_t* ep,
-    void* local_addr,
-    size_t size,
-    uint64_t remote_addr,
-    uint64_t remote_key,
-    uint64_t peer) {
-  if (!ep || !local_addr || size == 0) {
-    EFA_DEBUG("[EFA] read: invalid params (ep=%p, local_addr=%p, size=%zu)\n", ep, local_addr, size);
-    return EFA_ERROR_INVALID_PARAMS;
-  }
-
-  // Find local MR for descriptor - must match the address being read into
-  void* desc = nullptr;
-  uintptr_t addr_val = reinterpret_cast<uintptr_t>(local_addr);
-  for (auto& pair : ep->registered_mrs) {
-    const mr_info& info = pair.second;
-    if (addr_val >= info.addr && addr_val < info.addr + info.size) {
-      desc = info.desc;
-      break;
-    }
-  }
-
-  if (!desc) {
-    EFA_DEBUG("[EFA] read: no MR found covering local_addr=%p\n", local_addr);
-    return EFA_ERROR_MR_FAILED;
-  }
-
-  fi_addr_t fi_peer = static_cast<fi_addr_t>(peer);
-  EFA_DEBUG("[EFA] read: posting fi_read local=%p size=%zu remote=0x%lx key=%lu peer=%lu\n",
-          local_addr, size, remote_addr, remote_key, (unsigned long)fi_peer);
-
-  // Post read with retry on EAGAIN
+// Post an fi_tsend with EAGAIN retry
+static int post_tsend(rdmaxcel_efa_ep_t* ep, uint64_t tag, fi_addr_t peer) {
+  static char completion_byte = 1;
   for (int retries = 0; retries < 100000; retries++) {
-    ssize_t ret = fi_read(
-        ep->ep,
-        local_addr,
-        size,
-        desc,
-        fi_peer,
-        remote_addr,
-        remote_key,
-        nullptr);
-
-    if (ret == 0) {
-      EFA_DEBUG("[EFA] read: fi_read posted successfully\n");
-      return EFA_SUCCESS;
-    } else if (ret == -FI_EAGAIN) {
+    ssize_t ret = fi_tsend(ep->ep, &completion_byte, sizeof(completion_byte),
+                           nullptr, peer, tag, nullptr);
+    if (ret == 0) return EFA_SUCCESS;
+    if (ret == -FI_EAGAIN) {
       struct fi_cq_tagged_entry entry;
       fi_cq_read(ep->cq, &entry, 1);
       continue;
-    } else {
-      print_fi_error("fi_read failed", static_cast<int>(ret));
-      return EFA_ERROR_READ_FAILED;
     }
+    print_fi_error("fi_tsend failed", static_cast<int>(ret));
+    return EFA_ERROR_WRITE_FAILED;
   }
+  return EFA_ERROR_WRITE_FAILED;
+}
 
-  EFA_DEBUG("[EFA] read: exhausted retries\n");
+// Post an fi_trecv with EAGAIN retry
+static int post_trecv(rdmaxcel_efa_ep_t* ep, uint64_t tag) {
+  static char completion_byte = 0;
+  for (int retries = 0; retries < 100000; retries++) {
+    ssize_t ret = fi_trecv(ep->ep, &completion_byte, sizeof(completion_byte),
+                           nullptr, FI_ADDR_UNSPEC, tag, 0, nullptr);
+    if (ret == 0) return EFA_SUCCESS;
+    if (ret == -FI_EAGAIN) {
+      struct fi_cq_tagged_entry entry;
+      fi_cq_read(ep->cq, &entry, 1);
+      continue;
+    }
+    print_fi_error("fi_trecv failed", static_cast<int>(ret));
+    return EFA_ERROR_READ_FAILED;
+  }
   return EFA_ERROR_READ_FAILED;
 }
 
-int rdmaxcel_efa_poll_cq(rdmaxcel_efa_ep_t* ep, int max_spins) {
-  if (!ep) {
-    return EFA_ERROR_INVALID_PARAMS;
-  }
-
+// Spin-poll the CQ until a completion arrives or max_spins exhausted.
+// Returns: >0 completions, 0 if none after max_spins, <0 on error.
+static int poll_cq(rdmaxcel_efa_ep_t* ep, int max_spins) {
   struct fi_cq_tagged_entry entry;
+  int limit = (max_spins > 0) ? max_spins : INT_MAX;
 
-  for (int i = 0; i < max_spins; i++) {
+  for (int i = 0; i < limit; i++) {
     ssize_t ret = fi_cq_read(ep->cq, &entry, 1);
     if (ret > 0) {
       return static_cast<int>(ret);
@@ -477,95 +420,76 @@ int rdmaxcel_efa_poll_cq(rdmaxcel_efa_ep_t* ep, int max_spins) {
       continue;
     } else if (ret == -FI_EAVAIL) {
       struct fi_cq_err_entry err_entry;
-      ssize_t err_ret = fi_cq_readerr(ep->cq, &err_entry, 0);
-      if (err_ret > 0) {
-        fprintf(stderr, "[EFA] CQ error: %s (prov_errno=%d)\n",
-                fi_cq_strerror(ep->cq, err_entry.prov_errno, err_entry.err_data, nullptr, 0),
-                err_entry.prov_errno);
-      }
+      fi_cq_readerr(ep->cq, &err_entry, 0);
+      fprintf(stderr, "[EFA] CQ error: %s (prov_errno=%d)\n",
+              fi_cq_strerror(ep->cq, err_entry.prov_errno, err_entry.err_data, nullptr, 0),
+              err_entry.prov_errno);
       return EFA_ERROR_POLL_FAILED;
     } else {
-      fprintf(stderr, "[EFA] poll_cq failed with error: %s (%zd)\n", fi_strerror(-ret), ret);
+      fprintf(stderr, "[EFA] poll_cq error: %s (%zd)\n", fi_strerror(-ret), ret);
       return EFA_ERROR_POLL_FAILED;
     }
   }
-
-  return 0; // No completions after max_spins
+  return 0;
 }
 
-int rdmaxcel_efa_tsend(rdmaxcel_efa_ep_t* ep, uint64_t tag, uint64_t peer) {
-  if (!ep) {
+int rdmaxcel_efa_push_data(
+    rdmaxcel_efa_ep_t* ep,
+    void* local_addr,
+    size_t size,
+    uint64_t remote_addr,
+    uint64_t remote_key,
+    uint64_t peer,
+    uint64_t tag,
+    int max_poll_spins) {
+  if (!ep || !local_addr || size == 0) {
     return EFA_ERROR_INVALID_PARAMS;
   }
 
-  // Send a minimal tagged message (1 byte) as completion notification
-  static char completion_byte = 1;
+  void* desc = find_mr_desc(ep, local_addr);
+  if (!desc) {
+    EFA_DEBUG("[EFA] push_data: no MR found covering local_addr=%p\n", local_addr);
+    return EFA_ERROR_INVALID_PARAMS;
+  }
 
   fi_addr_t fi_peer = static_cast<fi_addr_t>(peer);
-  EFA_DEBUG("[EFA] tsend: sending with tag=%lu peer=%lu\n", tag, (unsigned long)fi_peer);
-  for (int retries = 0; retries < 100000; retries++) {
-    ssize_t ret = fi_tsend(
-        ep->ep,
-        &completion_byte,
-        sizeof(completion_byte),
-        nullptr,  // No descriptor needed for small message
-        fi_peer,
-        tag,
-        nullptr);  // No context
 
-    if (ret == 0) {
-      EFA_DEBUG("[EFA] tsend: posted successfully\n");
-      return EFA_SUCCESS;
-    } else if (ret == -FI_EAGAIN) {
-      // Resource temporarily unavailable, poll CQ and retry
-      struct fi_cq_tagged_entry entry;
-      fi_cq_read(ep->cq, &entry, 1);
-      continue;
-    } else {
-      print_fi_error("fi_tsend failed", static_cast<int>(ret));
-      return EFA_ERROR_WRITE_FAILED;
-    }
-  }
+  // Step 1: Post fi_write
+  int ret = post_write(ep, local_addr, size, desc, fi_peer, remote_addr, remote_key);
+  if (ret != EFA_SUCCESS) return ret;
 
-  return EFA_ERROR_WRITE_FAILED;
+  // Step 2: Poll for write completion
+  int completions = poll_cq(ep, max_poll_spins);
+  if (completions <= 0) return (completions < 0) ? completions : EFA_ERROR_TIMEOUT;
+
+  // Step 3: Send completion notification
+  ret = post_tsend(ep, tag, fi_peer);
+  if (ret != EFA_SUCCESS) return ret;
+
+  // Step 4: Poll for tsend completion
+  completions = poll_cq(ep, max_poll_spins);
+  if (completions <= 0) return (completions < 0) ? completions : EFA_ERROR_TIMEOUT;
+
+  return EFA_SUCCESS;
 }
 
-int rdmaxcel_efa_trecv(rdmaxcel_efa_ep_t* ep, uint64_t tag) {
+int rdmaxcel_efa_wait_for_data(
+    rdmaxcel_efa_ep_t* ep,
+    uint64_t tag,
+    int max_poll_spins) {
   if (!ep) {
     return EFA_ERROR_INVALID_PARAMS;
   }
 
-  // Post a tagged receive for completion notification
-  // Use exact tag matching to avoid confusion with concurrent transfers
-  static char completion_byte = 0;
+  // Step 1: Post trecv
+  int ret = post_trecv(ep, tag);
+  if (ret != EFA_SUCCESS) return ret;
 
-  EFA_DEBUG("[EFA] trecv: posting with tag=%lu\n", tag);
-  for (int retries = 0; retries < 100000; retries++) {
-    ssize_t ret = fi_trecv(
-        ep->ep,
-        &completion_byte,
-        sizeof(completion_byte),
-        nullptr,  // No descriptor needed for small message
-        FI_ADDR_UNSPEC,  // Accept from any source
-        tag,
-        0,  // No ignore mask - exact tag match
-        nullptr);  // No context
+  // Step 2: Poll for trecv completion (also drives fi_write progress)
+  int completions = poll_cq(ep, max_poll_spins);
+  if (completions <= 0) return (completions < 0) ? completions : EFA_ERROR_TIMEOUT;
 
-    if (ret == 0) {
-      EFA_DEBUG("[EFA] trecv: posted successfully\n");
-      return EFA_SUCCESS;
-    } else if (ret == -FI_EAGAIN) {
-      // Resource temporarily unavailable, poll CQ and retry
-      struct fi_cq_tagged_entry entry;
-      fi_cq_read(ep->cq, &entry, 1);
-      continue;
-    } else {
-      print_fi_error("fi_trecv failed", static_cast<int>(ret));
-      return EFA_ERROR_READ_FAILED;
-    }
-  }
-
-  return EFA_ERROR_READ_FAILED;
+  return EFA_SUCCESS;
 }
 
 const char* rdmaxcel_efa_error_string(int error_code) {
