@@ -51,9 +51,35 @@ use crate::efa_primitives::EfaEndpoint;
 use crate::efa_components::EfaBuffer;
 use crate::efa_supported;
 
-/// Max fi_cq_read spins per poll phase in push_data/wait_for_data.
-/// 0 = unlimited (spin until completion or error).
-const MAX_POLL_SPINS: i32 = 0;
+/// Max fi_cq_read spins per C-side poll phase.
+/// After this many spins, the C call returns 0 (no completion yet),
+/// and the Rust actor yields to the async runtime before retrying.
+const POLL_SPINS_PER_BATCH: i32 = 100_000;
+
+/// Yield control back to the async runtime, allowing other tasks
+/// (including hyperactor session heartbeats) to make progress.
+async fn async_yield_now() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct YieldNow(bool);
+
+    impl Future for YieldNow {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    YieldNow(false).await
+}
 
 /// Messages handled by EfaManagerActor
 #[derive(Handler, HandleClient, RefClient, Debug, Serialize, Deserialize, Named)]
@@ -344,18 +370,22 @@ impl EfaManagerMessageHandler for EfaManagerActor {
             fi_addr
         };
 
-        // Push data to dest and send completion notification (all in C)
-        endpoint.push_data(
-            local_mr.addr,
-            size,
-            remote_buffer.mr_addr as u64,
-            remote_buffer.mr_key,
-            peer,
-            tag,
-            MAX_POLL_SPINS,
-        ).map_err(|e| {
-            anyhow::anyhow!("Failed to push data: {}", e)
-        })?;
+        // Push data to dest and send completion notification.
+        // Retries with async yields between batches to keep heartbeats alive.
+        loop {
+            match endpoint.push_data(
+                local_mr.addr, size,
+                remote_buffer.mr_addr as u64, remote_buffer.mr_key,
+                peer, tag, POLL_SPINS_PER_BATCH,
+            ) {
+                Ok(()) => break,
+                Err(e) if e.code == -13 => { // EFA_ERROR_TIMEOUT = poll spins exhausted
+                    async_yield_now().await;
+                    continue;
+                }
+                Err(e) => return Err(anyhow::anyhow!("Failed to push data: {}", e)),
+            }
+        }
 
         Ok(true)
     }
@@ -383,10 +413,18 @@ impl EfaManagerMessageHandler for EfaManagerActor {
             self.known_peers.insert(remote_buffer.endpoint_addr.clone(), fi_addr);
         }
 
-        // Wait for source's data push and completion notification (all in C)
-        endpoint.wait_for_data(notification_tag, MAX_POLL_SPINS).map_err(|e| {
-            anyhow::anyhow!("Failed to wait for data: {}", e)
-        })?;
+        // Wait for source's data push and completion notification.
+        // Retries with async yields between batches to keep heartbeats alive.
+        loop {
+            match endpoint.wait_for_data(notification_tag, POLL_SPINS_PER_BATCH) {
+                Ok(()) => break,
+                Err(e) if e.code == -13 => { // EFA_ERROR_TIMEOUT = poll spins exhausted
+                    async_yield_now().await;
+                    continue;
+                }
+                Err(e) => return Err(anyhow::anyhow!("Failed to wait for data: {}", e)),
+            }
+        }
 
         Ok(())
     }
