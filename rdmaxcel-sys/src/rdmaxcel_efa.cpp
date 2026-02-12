@@ -462,32 +462,35 @@ int rdmaxcel_efa_read(
   return EFA_ERROR_READ_FAILED;
 }
 
-int rdmaxcel_efa_poll_cq(rdmaxcel_efa_ep_t* ep) {
+int rdmaxcel_efa_poll_cq(rdmaxcel_efa_ep_t* ep, int max_spins) {
   if (!ep) {
     return EFA_ERROR_INVALID_PARAMS;
   }
 
   struct fi_cq_tagged_entry entry;
-  ssize_t ret = fi_cq_read(ep->cq, &entry, 1);
 
-  if (ret > 0) {
-    return static_cast<int>(ret);
-  } else if (ret == -FI_EAGAIN) {
-    return 0; // No completions available
-  } else if (ret == -FI_EAVAIL) {
-    // Error available - read it
-    struct fi_cq_err_entry err_entry;
-    ssize_t err_ret = fi_cq_readerr(ep->cq, &err_entry, 0);
-    if (err_ret > 0) {
-      fprintf(stderr, "[EFA] CQ error: %s (prov_errno=%d)\n",
-              fi_cq_strerror(ep->cq, err_entry.prov_errno, err_entry.err_data, nullptr, 0),
-              err_entry.prov_errno);
+  for (int i = 0; i < max_spins; i++) {
+    ssize_t ret = fi_cq_read(ep->cq, &entry, 1);
+    if (ret > 0) {
+      return static_cast<int>(ret);
+    } else if (ret == -FI_EAGAIN) {
+      continue;
+    } else if (ret == -FI_EAVAIL) {
+      struct fi_cq_err_entry err_entry;
+      ssize_t err_ret = fi_cq_readerr(ep->cq, &err_entry, 0);
+      if (err_ret > 0) {
+        fprintf(stderr, "[EFA] CQ error: %s (prov_errno=%d)\n",
+                fi_cq_strerror(ep->cq, err_entry.prov_errno, err_entry.err_data, nullptr, 0),
+                err_entry.prov_errno);
+      }
+      return EFA_ERROR_POLL_FAILED;
+    } else {
+      fprintf(stderr, "[EFA] poll_cq failed with error: %s (%zd)\n", fi_strerror(-ret), ret);
+      return EFA_ERROR_POLL_FAILED;
     }
-    return EFA_ERROR_POLL_FAILED;
-  } else {
-    fprintf(stderr, "[EFA] poll_cq failed with error: %s (%zd)\n", fi_strerror(-ret), ret);
-    return EFA_ERROR_POLL_FAILED;
   }
+
+  return 0; // No completions after max_spins
 }
 
 int rdmaxcel_efa_tsend(rdmaxcel_efa_ep_t* ep, uint64_t tag, uint64_t peer) {

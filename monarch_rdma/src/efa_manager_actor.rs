@@ -32,7 +32,6 @@
 //! - Tagged messaging for completion notification instead of CQ polling
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use hyperactor::Actor;
@@ -82,37 +81,32 @@ async fn async_yield_now() {
 
 /// Poll the EFA completion queue with spin-polling and async yielding.
 ///
-/// Spins for up to `SPINS_BEFORE_YIELD` iterations before yielding to the
-/// async runtime, keeping latency low while allowing other tasks (like
-/// hyperactor session heartbeats) to make progress.
+/// Each call to poll_cq spins for SPINS_PER_POLL iterations in C (tight loop,
+/// no FFI overhead per spin). Between batches, yields to the async runtime
+/// to allow other tasks (like hyperactor session heartbeats) to make progress.
+/// Gives up after MAX_POLL_ATTEMPTS batches.
 async fn poll_for_completion(
     endpoint: &EfaEndpoint,
-    timeout: u64,
     operation: &str,
 ) -> Result<i32, anyhow::Error> {
-    let timeout_duration = Duration::from_secs(timeout);
-    let start_time = std::time::Instant::now();
-    const SPINS_BEFORE_YIELD: u32 = 10_000;
-    let mut spin_count: u32 = 0;
-    loop {
-        let completions = endpoint.poll_cq().map_err(|e| {
+    const SPINS_PER_POLL: i32 = 10_000;
+    const MAX_POLL_ATTEMPTS: u32 = 100_000;
+
+    for _ in 0..MAX_POLL_ATTEMPTS {
+        let completions = endpoint.poll_cq(SPINS_PER_POLL).map_err(|e| {
             anyhow::anyhow!("Failed to poll for {} completion: {}", operation, e)
         })?;
         if completions > 0 {
             return Ok(completions);
         }
-        spin_count += 1;
-        if start_time.elapsed() >= timeout_duration {
-            return Err(anyhow::anyhow!(
-                "Timeout waiting for {} completion",
-                operation
-            ));
-        }
-        if spin_count >= SPINS_BEFORE_YIELD {
-            spin_count = 0;
-            async_yield_now().await;
-        }
+        async_yield_now().await;
     }
+
+    Err(anyhow::anyhow!(
+        "Timeout waiting for {} completion after {} attempts",
+        operation,
+        MAX_POLL_ATTEMPTS,
+    ))
 }
 
 /// Messages handled by EfaManagerActor
@@ -416,7 +410,7 @@ impl EfaManagerMessageHandler for EfaManagerActor {
         })?;
 
         // Poll for write completion
-        poll_for_completion(endpoint, timeout, "write").await?;
+        poll_for_completion(endpoint, "write").await?;
 
         // Send completion notification to dest
         endpoint.tsend(tag, peer).map_err(|e| {
@@ -424,7 +418,7 @@ impl EfaManagerMessageHandler for EfaManagerActor {
         })?;
 
         // Poll for tsend completion
-        poll_for_completion(endpoint, timeout, "tsend").await?;
+        poll_for_completion(endpoint, "tsend").await?;
 
         Ok(true)
     }
@@ -457,7 +451,7 @@ impl EfaManagerMessageHandler for EfaManagerActor {
             anyhow::anyhow!("Failed to post trecv: {}", e)
         })?;
 
-        poll_for_completion(endpoint, timeout, "trecv").await?;
+        poll_for_completion(endpoint, "trecv").await?;
 
         Ok(())
     }

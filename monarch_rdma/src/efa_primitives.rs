@@ -175,9 +175,10 @@ impl EfaEndpoint {
         efa_call!(rdmaxcel_efa_read(self.ep, local_addr as *mut _, size, remote_addr, remote_key, peer))
     }
 
-    /// Poll completion queue (non-blocking). Returns number of completions (0 = none available).
-    pub fn poll_cq(&self) -> EfaResult<i32> {
-        let ret = unsafe { rdmaxcel_efa_poll_cq(self.ep) };
+    /// Poll completion queue, spinning for up to max_spins iterations.
+    /// Returns number of completions (>0), 0 if none after max_spins.
+    pub fn poll_cq(&self, max_spins: i32) -> EfaResult<i32> {
+        let ret = unsafe { rdmaxcel_efa_poll_cq(self.ep, max_spins) };
         if ret < 0 {
             return Err(EfaError::from(ret));
         }
