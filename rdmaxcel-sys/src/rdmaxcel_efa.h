@@ -97,22 +97,31 @@ int rdmaxcel_efa_deregister_mr(
     rdmaxcel_efa_ep_t* ep,
     uint64_t key);
 
-// Push data to a remote peer: fi_write + poll + fi_tsend + poll
-// This is the source-side operation. The destination must call wait_for_data.
-int rdmaxcel_efa_push_data(
+// Post an RDMA write (returns immediately, does not wait for completion)
+int rdmaxcel_efa_post_write(
     rdmaxcel_efa_ep_t* ep,
     void* local_addr,
     size_t size,
     uint64_t remote_addr,
     uint64_t remote_key,
-    uint64_t peer,
-    uint64_t tag);
+    uint64_t peer);
 
-// Wait for data from a remote peer: fi_trecv + poll
-// This is the destination-side operation. The source must call push_data.
-int rdmaxcel_efa_wait_for_data(
+// Post a tagged send for completion notification (returns immediately)
+int rdmaxcel_efa_post_tsend(
+    rdmaxcel_efa_ep_t* ep,
+    uint64_t tag,
+    uint64_t peer);
+
+// Post a tagged receive for completion notification (returns immediately)
+int rdmaxcel_efa_post_trecv(
     rdmaxcel_efa_ep_t* ep,
     uint64_t tag);
+
+// Poll completion queue, spinning for up to max_spins iterations
+// Returns: >0 completions, 0 if none after max_spins, <0 on error
+int rdmaxcel_efa_poll_cq(
+    rdmaxcel_efa_ep_t* ep,
+    int max_spins);
 
 // Get error string for EFA error code
 const char* rdmaxcel_efa_error_string(int error_code);
