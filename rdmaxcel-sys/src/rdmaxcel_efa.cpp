@@ -156,8 +156,7 @@ rdmaxcel_efa_ep_t* rdmaxcel_efa_ep_create(
   // Set up fabric hints
   struct fi_info* hints = fi_allocinfo();
   if (!hints) {
-    free(ep->buffer);
-    delete ep;
+    rdmaxcel_efa_ep_destroy(ep);
     return nullptr;
   }
 
@@ -174,121 +173,42 @@ rdmaxcel_efa_ep_t* rdmaxcel_efa_ep_create(
 
   if (ret != 0 || !ep->fi) {
     print_fi_error("fi_getinfo failed", ret);
-    free(ep->buffer);
-    delete ep;
+    rdmaxcel_efa_ep_destroy(ep);
     return nullptr;
   }
 
-  // Create fabric
+  // Create fabric, domain, CQ, AV, endpoint — on failure, destroy cleans up
+  // everything allocated so far since fields are zero-initialized.
   ret = fi_fabric(ep->fi->fabric_attr, &ep->fabric, nullptr);
-  if (ret != 0) {
-    print_fi_error("fi_fabric failed", ret);
-    fi_freeinfo(ep->fi);
-    free(ep->buffer);
-    delete ep;
-    return nullptr;
-  }
+  if (ret != 0) { print_fi_error("fi_fabric failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
 
-  // Create domain
   ret = fi_domain(ep->fabric, ep->fi, &ep->domain, nullptr);
-  if (ret != 0) {
-    print_fi_error("fi_domain failed", ret);
-    fi_close(&ep->fabric->fid);
-    fi_freeinfo(ep->fi);
-    free(ep->buffer);
-    delete ep;
-    return nullptr;
-  }
+  if (ret != 0) { print_fi_error("fi_domain failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
 
-  // Create completion queue
   struct fi_cq_attr cq_attr = {};
   cq_attr.size = 8192;
   cq_attr.format = FI_CQ_FORMAT_TAGGED;
   cq_attr.wait_obj = FI_WAIT_NONE;
   ret = fi_cq_open(ep->domain, &cq_attr, &ep->cq, nullptr);
-  if (ret != 0) {
-    print_fi_error("fi_cq_open failed", ret);
-    fi_close(&ep->domain->fid);
-    fi_close(&ep->fabric->fid);
-    fi_freeinfo(ep->fi);
-    free(ep->buffer);
-    delete ep;
-    return nullptr;
-  }
+  if (ret != 0) { print_fi_error("fi_cq_open failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
 
-  // Create address vector
   struct fi_av_attr av_attr = {};
   av_attr.type = FI_AV_MAP;
   av_attr.count = 16;
   ret = fi_av_open(ep->domain, &av_attr, &ep->av, nullptr);
-  if (ret != 0) {
-    print_fi_error("fi_av_open failed", ret);
-    fi_close(&ep->cq->fid);
-    fi_close(&ep->domain->fid);
-    fi_close(&ep->fabric->fid);
-    fi_freeinfo(ep->fi);
-    free(ep->buffer);
-    delete ep;
-    return nullptr;
-  }
+  if (ret != 0) { print_fi_error("fi_av_open failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
 
-  // Create endpoint
   ret = fi_endpoint(ep->domain, ep->fi, &ep->ep, nullptr);
-  if (ret != 0) {
-    print_fi_error("fi_endpoint failed", ret);
-    fi_close(&ep->av->fid);
-    fi_close(&ep->cq->fid);
-    fi_close(&ep->domain->fid);
-    fi_close(&ep->fabric->fid);
-    fi_freeinfo(ep->fi);
-    free(ep->buffer);
-    delete ep;
-    return nullptr;
-  }
+  if (ret != 0) { print_fi_error("fi_endpoint failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
 
-  // Bind CQ and AV to endpoint
   ret = fi_ep_bind(ep->ep, &ep->cq->fid, FI_TRANSMIT | FI_RECV);
-  if (ret != 0) {
-    print_fi_error("fi_ep_bind CQ failed", ret);
-    fi_close(&ep->ep->fid);
-    fi_close(&ep->av->fid);
-    fi_close(&ep->cq->fid);
-    fi_close(&ep->domain->fid);
-    fi_close(&ep->fabric->fid);
-    fi_freeinfo(ep->fi);
-    free(ep->buffer);
-    delete ep;
-    return nullptr;
-  }
+  if (ret != 0) { print_fi_error("fi_ep_bind CQ failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
 
   ret = fi_ep_bind(ep->ep, &ep->av->fid, 0);
-  if (ret != 0) {
-    print_fi_error("fi_ep_bind AV failed", ret);
-    fi_close(&ep->ep->fid);
-    fi_close(&ep->av->fid);
-    fi_close(&ep->cq->fid);
-    fi_close(&ep->domain->fid);
-    fi_close(&ep->fabric->fid);
-    fi_freeinfo(ep->fi);
-    free(ep->buffer);
-    delete ep;
-    return nullptr;
-  }
+  if (ret != 0) { print_fi_error("fi_ep_bind AV failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
 
-  // Enable endpoint
   ret = fi_enable(ep->ep);
-  if (ret != 0) {
-    print_fi_error("fi_enable failed", ret);
-    fi_close(&ep->ep->fid);
-    fi_close(&ep->av->fid);
-    fi_close(&ep->cq->fid);
-    fi_close(&ep->domain->fid);
-    fi_close(&ep->fabric->fid);
-    fi_freeinfo(ep->fi);
-    free(ep->buffer);
-    delete ep;
-    return nullptr;
-  }
+  if (ret != 0) { print_fi_error("fi_enable failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
 
   // Get local address for later connection
   ret = fi_getname(&ep->ep->fid, ep->local_addr, &ep->local_addr_len);
