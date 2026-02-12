@@ -288,18 +288,6 @@ int rdmaxcel_efa_register_mr(
     return EFA_ERROR_INVALID_PARAMS;
   }
 
-  // Pre-fault all pages before registration to avoid hangs in fi_mr_reg
-  // Touch every 4KB page to ensure they're backed by physical memory
-  EFA_DEBUG("[EFA] Pre-faulting %zu bytes (%zu MB) before registration...\n",
-          size, size / (1024 * 1024));
-  volatile char* ptr = static_cast<volatile char*>(addr);
-  const size_t page_size = 4096;
-  for (size_t i = 0; i < size; i += page_size) {
-    // Read to fault in the page
-    (void)ptr[i];
-  }
-  EFA_DEBUG("[EFA] Pre-faulting complete, calling fi_mr_reg...\n");
-
   struct fid_mr* mr = nullptr;
   uint64_t access =
       FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE | FI_SEND | FI_RECV;
