@@ -393,11 +393,16 @@ impl CppStaticLibsConfig {
         // Link libfabric statically for EFA support.
         // Path is exported by rdmaxcel-sys via cargo:metadata=LIBFABRIC_A=...
         // Only available when rdmaxcel-sys is a dependency (tensor_engine feature).
-        if let Ok(libfabric_a) = std::env::var("DEP_RDMAXCEL_LIBFABRIC_A") {
-            println!("cargo:warning=Linking libfabric from {}", libfabric_a);
-            println!("cargo:rustc-link-arg=-Wl,--whole-archive");
-            println!("cargo:rustc-link-arg={}", libfabric_a);
-            println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
+        match std::env::var("DEP_RDMAXCEL_LIBFABRIC_A") {
+            Ok(libfabric_a) => {
+                println!("cargo:warning=Linking libfabric from {}", libfabric_a);
+                println!("cargo:rustc-link-arg=-Wl,--whole-archive");
+                println!("cargo:rustc-link-arg={}", libfabric_a);
+                println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
+            }
+            Err(e) => {
+                println!("cargo:warning=DEP_RDMAXCEL_LIBFABRIC_A not set ({}), libfabric will not be linked", e);
+            }
         }
     }
 }
