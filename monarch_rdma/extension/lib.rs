@@ -169,7 +169,7 @@ async fn create_rdma_buffer(
         let owner_id = ActorId(proc_id, "efa_manager".to_string(), 0);
         let owner_ref: ActorRef<EfaManagerActor> = ActorRef::attest(owner_id);
         let buffer = owner_ref
-            .request_buffer(client.deref(), addr, size)
+            .register_buffer(client.deref(), addr, size)
             .await?;
         Ok(PyRdmaBuffer { inner: BufferInner::Efa { buffer, owner_ref } })
     } else {
@@ -287,7 +287,7 @@ impl PyRdmaBuffer {
                 let buffer = buffer.clone();
                 PyPythonTask::new(async move {
                     let local_buffer = local_owner_ref
-                        .request_buffer(client.deref(), addr, size)
+                        .register_buffer(client.deref(), addr, size)
                         .await
                         .map_err(|e| PyException::new_err(format!("failed to request EFA buffer: {}", e)))?;
                     local_buffer
@@ -349,7 +349,7 @@ impl PyRdmaBuffer {
                 let buffer = buffer.clone();
                 PyPythonTask::new(async move {
                     let local_buffer = local_owner_ref
-                        .request_buffer(client.deref(), addr, size)
+                        .register_buffer(client.deref(), addr, size)
                         .await
                         .map_err(|e| PyException::new_err(format!("failed to request EFA buffer: {}", e)))?;
                     buffer

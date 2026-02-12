@@ -113,14 +113,14 @@ async fn poll_for_completion(
 #[derive(Handler, HandleClient, RefClient, Debug, Serialize, Deserialize, Named)]
 pub enum EfaManagerMessage {
     /// Request a buffer to be registered with the EFA endpoint
-    RequestBuffer {
+    RegisterBuffer {
         addr: usize,
         size: usize,
         #[reply]
         reply: OncePortRef<EfaBuffer>,
     },
     /// Release a previously registered buffer
-    ReleaseBuffer {
+    DeregisterBuffer {
         buffer: EfaBuffer,
     },
     /// Read data from a remote peer into a local buffer
@@ -258,7 +258,7 @@ impl Actor for EfaManagerActor {
 impl EfaManagerMessageHandler for EfaManagerActor {
     /// Registers a memory region and returns an EfaBuffer handle.
     /// If the same (addr, size) is already registered, returns the cached handle.
-    async fn request_buffer(
+    async fn register_buffer(
         &mut self,
         cx: &Context<Self>,
         addr: usize,
@@ -272,7 +272,7 @@ impl EfaManagerMessageHandler for EfaManagerActor {
         for (&mr_id, mr) in &self.memory_regions {
             if mr.addr == addr && mr.size == size {
                 tracing::info!(
-                    "[EFA] request_buffer: CACHED mr_id={}, addr=0x{:x}, key={}",
+                    "[EFA] register_buffer: CACHED mr_id={}, addr=0x{:x}, key={}",
                     mr_id, addr, mr.key
                 );
                 return Ok(EfaBuffer {
@@ -308,20 +308,20 @@ impl EfaManagerMessageHandler for EfaManagerActor {
             mr_key: key,
         };
         tracing::info!(
-            "[EFA] request_buffer: mr_id={}, addr=0x{:x}, size={}, key={}",
+            "[EFA] register_buffer: mr_id={}, addr=0x{:x}, size={}, key={}",
             mr_id, addr, size, key
         );
         Ok(buffer)
     }
 
     /// Deregisters a memory region.
-    async fn release_buffer(
+    async fn deregister_buffer(
         &mut self,
         _cx: &Context<Self>,
         buffer: EfaBuffer,
     ) -> Result<(), anyhow::Error> {
         tracing::info!(
-            "[EFA] release_buffer called: mr_id={}, addr=0x{:x}, key={}",
+            "[EFA] deregister_buffer called: mr_id={}, addr=0x{:x}, key={}",
             buffer.mr_id, buffer.mr_addr, buffer.mr_key
         );
         if let Some(mr) = self.memory_regions.remove(&buffer.mr_id) {

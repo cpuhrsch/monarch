@@ -158,7 +158,7 @@ impl EfaBuffer {
     /// `Ok(())` if the operation completed successfully.
     pub async fn drop_buffer(&self, client: &impl context::Actor) -> Result<(), anyhow::Error> {
         tracing::debug!("[efa_buffer] dropping buffer {:?}", self);
-        self.owner.release_buffer(client, self.clone()).await?;
+        self.owner.deregister_buffer(client, self.clone()).await?;
         Ok(())
     }
 }
