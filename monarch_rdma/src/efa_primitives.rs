@@ -98,7 +98,7 @@ impl std::fmt::Debug for EfaEndpoint {
 }
 
 impl EfaEndpoint {
-    pub fn new(provider: &str, buffer_size: usize) -> EfaResult<Self> {
+    pub fn new(provider: &str) -> EfaResult<Self> {
         if !efa_available() {
             return Err(EfaError {
                 code: EFA_ERROR_NOT_AVAILABLE,
@@ -111,7 +111,7 @@ impl EfaEndpoint {
             message: "Invalid provider name".to_string(),
         })?;
 
-        let ep = unsafe { rdmaxcel_efa_ep_create(provider_cstr.as_ptr(), buffer_size) };
+        let ep = unsafe { rdmaxcel_efa_ep_create(provider_cstr.as_ptr()) };
 
         if ep.is_null() {
             return Err(EfaError {

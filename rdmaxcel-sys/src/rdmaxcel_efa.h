@@ -45,11 +45,8 @@ int rdmaxcel_efa_available(void);
 // Create EFA endpoint
 // Parameters:
 //   provider: Provider name, typically "efa" for AWS EFA
-//   buffer_size: Size of internal buffer to allocate (0 for no buffer)
 // Returns: Pointer to endpoint on success, NULL on failure
-rdmaxcel_efa_ep_t* rdmaxcel_efa_ep_create(
-    const char* provider,
-    size_t buffer_size);
+rdmaxcel_efa_ep_t* rdmaxcel_efa_ep_create(const char* provider);
 
 // Destroy EFA endpoint and free resources
 void rdmaxcel_efa_ep_destroy(rdmaxcel_efa_ep_t* ep);

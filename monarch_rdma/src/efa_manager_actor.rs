@@ -220,7 +220,7 @@ impl RemoteSpawn for EfaManagerActor {
             ));
         }
 
-        let endpoint = EfaEndpoint::new("efa", 0).map_err(|e| {
+        let endpoint = EfaEndpoint::new("efa").map_err(|e| {
             anyhow::anyhow!("Failed to create EFA endpoint: {}", e)
         })?;
 

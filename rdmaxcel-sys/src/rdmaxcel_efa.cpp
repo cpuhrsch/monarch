@@ -66,8 +66,6 @@ struct rdmaxcel_efa_ep {
   uint64_t next_mr_key;
   char local_addr[256];
   size_t local_addr_len;
-  void* buffer;
-  size_t buffer_size;
 };
 
 // Helper: Print libfabric error
@@ -135,9 +133,7 @@ int rdmaxcel_efa_available(void) {
   return 0;
 }
 
-rdmaxcel_efa_ep_t* rdmaxcel_efa_ep_create(
-    const char* provider,
-    size_t buffer_size) {
+rdmaxcel_efa_ep_t* rdmaxcel_efa_ep_create(const char* provider) {
   // Initialize platform settings on first use
   static bool platform_initialized = false;
   if (!platform_initialized) {
@@ -151,18 +147,8 @@ rdmaxcel_efa_ep_t* rdmaxcel_efa_ep_create(
     return nullptr;
   }
 
-  ep->buffer_size = buffer_size;
   ep->next_mr_key = 1;
   ep->local_addr_len = sizeof(ep->local_addr);
-
-  // Allocate buffer if requested
-  if (buffer_size > 0) {
-    ep->buffer = malloc(buffer_size);
-    if (!ep->buffer) {
-      delete ep;
-      return nullptr;
-    }
-  }
 
   // Set up fabric hints
   struct fi_info* hints = fi_allocinfo();
@@ -251,9 +237,6 @@ void rdmaxcel_efa_ep_destroy(rdmaxcel_efa_ep_t* ep) {
     fi_freeinfo(ep->fi);
   }
 
-  if (ep->buffer) {
-    free(ep->buffer);
-  }
   delete ep;
 }
 
