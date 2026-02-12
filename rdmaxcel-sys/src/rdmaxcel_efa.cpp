@@ -34,6 +34,17 @@ static inline bool efa_debug_enabled() {
 }
 #define EFA_DEBUG(...) do { if (efa_debug_enabled()) fprintf(stderr, __VA_ARGS__); } while(0)
 
+// Helper macro for ep_create: call a libfabric function, destroy ep and return nullptr on failure.
+#define EFA_EP_TRY(call, msg) \
+  do { \
+    int _ret = (call); \
+    if (_ret != 0) { \
+      print_fi_error(msg, _ret); \
+      rdmaxcel_efa_ep_destroy(ep); \
+      return nullptr; \
+    } \
+  } while(0)
+
 // Info about a registered memory region
 struct mr_info {
   struct fid_mr* mr;
@@ -179,36 +190,24 @@ rdmaxcel_efa_ep_t* rdmaxcel_efa_ep_create(
 
   // Create fabric, domain, CQ, AV, endpoint — on failure, destroy cleans up
   // everything allocated so far since fields are zero-initialized.
-  ret = fi_fabric(ep->fi->fabric_attr, &ep->fabric, nullptr);
-  if (ret != 0) { print_fi_error("fi_fabric failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
-
-  ret = fi_domain(ep->fabric, ep->fi, &ep->domain, nullptr);
-  if (ret != 0) { print_fi_error("fi_domain failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
+  EFA_EP_TRY(fi_fabric(ep->fi->fabric_attr, &ep->fabric, nullptr), "fi_fabric failed");
+  EFA_EP_TRY(fi_domain(ep->fabric, ep->fi, &ep->domain, nullptr), "fi_domain failed");
 
   struct fi_cq_attr cq_attr = {};
   cq_attr.size = 8192;
   cq_attr.format = FI_CQ_FORMAT_TAGGED;
   cq_attr.wait_obj = FI_WAIT_NONE;
-  ret = fi_cq_open(ep->domain, &cq_attr, &ep->cq, nullptr);
-  if (ret != 0) { print_fi_error("fi_cq_open failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
+  EFA_EP_TRY(fi_cq_open(ep->domain, &cq_attr, &ep->cq, nullptr), "fi_cq_open failed");
 
   struct fi_av_attr av_attr = {};
   av_attr.type = FI_AV_MAP;
   av_attr.count = 16;
-  ret = fi_av_open(ep->domain, &av_attr, &ep->av, nullptr);
-  if (ret != 0) { print_fi_error("fi_av_open failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
+  EFA_EP_TRY(fi_av_open(ep->domain, &av_attr, &ep->av, nullptr), "fi_av_open failed");
 
-  ret = fi_endpoint(ep->domain, ep->fi, &ep->ep, nullptr);
-  if (ret != 0) { print_fi_error("fi_endpoint failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
-
-  ret = fi_ep_bind(ep->ep, &ep->cq->fid, FI_TRANSMIT | FI_RECV);
-  if (ret != 0) { print_fi_error("fi_ep_bind CQ failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
-
-  ret = fi_ep_bind(ep->ep, &ep->av->fid, 0);
-  if (ret != 0) { print_fi_error("fi_ep_bind AV failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
-
-  ret = fi_enable(ep->ep);
-  if (ret != 0) { print_fi_error("fi_enable failed", ret); rdmaxcel_efa_ep_destroy(ep); return nullptr; }
+  EFA_EP_TRY(fi_endpoint(ep->domain, ep->fi, &ep->ep, nullptr), "fi_endpoint failed");
+  EFA_EP_TRY(fi_ep_bind(ep->ep, &ep->cq->fid, FI_TRANSMIT | FI_RECV), "fi_ep_bind CQ failed");
+  EFA_EP_TRY(fi_ep_bind(ep->ep, &ep->av->fid, 0), "fi_ep_bind AV failed");
+  EFA_EP_TRY(fi_enable(ep->ep), "fi_enable failed");
 
   // Get local address for later connection
   ret = fi_getname(&ep->ep->fid, ep->local_addr, &ep->local_addr_len);
