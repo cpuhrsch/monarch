@@ -65,12 +65,12 @@ def test_memoryview_from_mmap():
 
     from monarch._src.rdma.rdma import _get_addr_and_size
 
-    # Anonymous mmap — pages are zero-filled and faulted on access
     mm = mmap.mmap(-1, 4096)
     mv = memoryview(mm)
     addr, size = _get_addr_and_size(mv)
     assert size == 4096
     assert addr > 0
+    del mv
     mm.close()
 
 
@@ -80,12 +80,12 @@ def test_memoryview_from_mmap_unfaulted():
 
     from monarch._src.rdma.rdma import _get_addr_and_size
 
-    # 1MB anonymous mmap — OS may not fault all pages until accessed
     mm = mmap.mmap(-1, 1024 * 1024)
     mv = memoryview(mm)
     addr, size = _get_addr_and_size(mv)
     assert size == 1024 * 1024
     assert addr > 0
+    del mv
     mm.close()
 
 
