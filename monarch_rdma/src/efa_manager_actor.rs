@@ -375,18 +375,10 @@ impl EfaManagerMessageHandler for EfaManagerActor {
             self.known_peers.insert(remote_buffer.endpoint_addr.clone(), fi_addr);
         }
 
-        // Wait for source's data push and completion notification.
-        // Retries with async yields between batches to keep heartbeats alive.
-        loop {
-            match endpoint.wait_for_data(notification_tag, POLL_SPINS_PER_BATCH) {
-                Ok(()) => break,
-                Err(e) if e.code == -13 => { // EFA_ERROR_TIMEOUT = poll spins exhausted
-                    async_yield_now().await;
-                    continue;
-                }
-                Err(e) => return Err(anyhow::anyhow!("Failed to wait for data: {}", e)),
-            }
-        }
+        // Wait for source's data push and completion notification (all in C, spins until done)
+        endpoint.wait_for_data(notification_tag, 0).map_err(|e| {
+            anyhow::anyhow!("Failed to wait for data: {}", e)
+        })?;
 
         Ok(())
     }
