@@ -412,15 +412,7 @@ impl PyRdmaBuffer {
 #[pyclass(name = "_RdmaManager", module = "monarch._rust_bindings.rdma")]
 pub struct PyRdmaManager {
     #[allow(dead_code)]
-    _inner: Box<dyn std::any::Any + Send>,
-}
-
-impl PyRdmaManager {
-    fn new<A: Send + 'static>(actor_mesh: hyperactor_mesh::v1::ActorMesh<A>) -> Self {
-        let actor_mesh = RootActorMesh::from(actor_mesh);
-        let inner: Box<dyn std::any::Any + Send> = Box::new(SharedCell::from(actor_mesh));
-        PyRdmaManager { _inner: inner }
-    }
+    _inner: Box<dyn std::any::Any + Send + Sync>,
 }
 
 #[pymethods]
@@ -444,21 +436,27 @@ impl PyRdmaManager {
 
         if efa_supported() {
             PyPythonTask::new(async move {
-                let actor_mesh = proc_mesh
-                    .spawn_service::<EfaManagerActor>(client.deref(), "efa_manager", &())
+                let actor_mesh: hyperactor_mesh::v1::ActorMesh<EfaManagerActor> = proc_mesh
+                    .spawn_service(client.deref(), "efa_manager", &())
                     .await
                     .map_err(|err| PyException::new_err(err.to_string()))?;
-                Ok(Some(PyRdmaManager::new(actor_mesh)))
+
+                let inner: Box<dyn std::any::Any + Send + Sync> =
+                    Box::new(SharedCell::from(RootActorMesh::from(actor_mesh)));
+                Ok(Some(PyRdmaManager { _inner: inner }))
             })
         } else {
             PyPythonTask::new(async move {
-                let actor_mesh = proc_mesh
+                let actor_mesh: hyperactor_mesh::v1::ActorMesh<RdmaManagerActor> = proc_mesh
                     // Pass None to use default config - RdmaManagerActor will use default IbverbsConfig
                     // TODO - make IbverbsConfig configurable
-                    .spawn_service::<RdmaManagerActor>(client.deref(), "rdma_manager", &None)
+                    .spawn_service(client.deref(), "rdma_manager", &None)
                     .await
                     .map_err(|err| PyException::new_err(err.to_string()))?;
-                Ok(Some(PyRdmaManager::new(actor_mesh)))
+
+                let inner: Box<dyn std::any::Any + Send + Sync> =
+                    Box::new(SharedCell::from(RootActorMesh::from(actor_mesh)));
+                Ok(Some(PyRdmaManager { _inner: inner }))
             })
         }
     }
