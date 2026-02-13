@@ -1188,11 +1188,10 @@ impl RdmaQueuePair {
     /// # Arguments
     ///
     /// * `local_addr` - The local address containing data to send
-    /// * `lkey` - Local key for the memory region
     /// * `length` - Length of the data to send
     /// * `wr_id` - Work request ID for completion identification
     /// * `signaled` - Whether to generate a completion event
-    /// * `op_type` - Operation type (Write, Read, Recv, WriteWithImm)
+    /// * `op_type` - Optional operation type
     /// * `raddr` - the remote address, representing the memory location on the remote peer
     /// * `rkey` - the remote key, representing the key required to access the remote memory region
     fn post_op(
