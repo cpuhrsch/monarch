@@ -48,21 +48,39 @@ class PingPongActor(Actor):
 def main(
     data_size_mb: int = 100,
     num_iterations: int = 5,
+    backend: str = "slurm",
     partition: Optional[str] = None,
+    hpc_identity: str = "hyper_monarch",
+    hpc_job_oncall: str = "monarch",
+    hpc_cluster_uuid: str = "MastGenAICluster",
+    rm_attribution: str = "msl_infra_pytorch_dev",
 ):
     """RDMA Pingpong: transfer data between two nodes via RDMABuffer."""
     sys.stdout.reconfigure(line_buffering=True)
     size = data_size_mb * 1024 * 1024
 
-    from monarch.job import SlurmJob
-
-    job = SlurmJob(
-        meshes={"workers": 2},
-        gpus_per_node=1,
-        partition=partition,
-        exclusive=False,
-        log_dir=os.path.expanduser("~/monarch_slurm_logs"),
-    )
+    if backend == "mast":
+        from monarch.actor import enable_transport
+        from monarch.job.meta import MASTJob
+        enable_transport("metatls-hostname")
+        job = MASTJob(
+            hpcIdentity=hpc_identity,
+            hpcJobOncall=hpc_job_oncall,
+            hpcClusterUuid=hpc_cluster_uuid,
+            rmAttribution=rm_attribution,
+            useStrictName=True,
+            localityConstraints=["region", "gtn"],
+        )
+        job.add_mesh("workers", 2)
+    else:
+        from monarch.job import SlurmJob
+        job = SlurmJob(
+            meshes={"workers": 2},
+            gpus_per_node=1,
+            partition=partition,
+            exclusive=False,
+            log_dir=os.path.expanduser("~/monarch_slurm_logs"),
+        )
 
     workers = job.state().workers
     procs = workers.spawn_procs()
