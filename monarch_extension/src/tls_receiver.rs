@@ -28,7 +28,8 @@ const CERT_PATH: &str = "/var/facebook/x509_identities/server.pem";
 fn make_server_tls_config() -> Result<Arc<rustls::ServerConfig>, String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cert_pem = std::fs::read(CERT_PATH).map_err(|e| format!("read {CERT_PATH} failed: {e}"))?;
+    let cert_path = std::env::var("MONARCH_TLS_CERT_PATH").unwrap_or_else(|_| CERT_PATH.to_string());
+    let cert_pem = std::fs::read(&cert_path).map_err(|e| format!("read {cert_path} failed: {e}"))?;
 
     let certs = rustls_pemfile::certs(&mut BufReader::new(&cert_pem[..]))
         .filter_map(Result::ok)
@@ -48,8 +49,8 @@ fn make_server_tls_config() -> Result<Arc<rustls::ServerConfig>, String> {
                     break rustls::pki_types::PrivateKeyDer::Sec1(k);
                 }
                 Ok(Some(_)) => continue,
-                Ok(None) => return Err(format!("no private key found in {CERT_PATH}")),
-                Err(e) => return Err(format!("parse {CERT_PATH} failed: {e}")),
+                Ok(None) => return Err(format!("no private key found in {cert_path}")),
+                Err(e) => return Err(format!("parse {cert_path} failed: {e}")),
             }
         }
     };
@@ -62,8 +63,17 @@ fn make_server_tls_config() -> Result<Arc<rustls::ServerConfig>, String> {
     Ok(Arc::new(config))
 }
 
-/// Return the FQDN of this host.
-fn get_fqdn() -> Result<String, String> {
+/// Return the address that senders should connect to.
+///
+/// Prefers POD_IP (set by kfair via Kubernetes downward API) because
+/// pod hostnames aren't resolvable from outside the cluster.
+/// Falls back to FQDN for Meta-internal environments.
+fn get_host() -> Result<String, String> {
+    if let Ok(ip) = std::env::var("POD_IP") {
+        if !ip.is_empty() {
+            return Ok(ip);
+        }
+    }
     let output = std::process::Command::new("hostname")
         .arg("-f")
         .output()
@@ -95,14 +105,20 @@ impl TlsReceiver {
     fn new(num_streams: usize) -> PyResult<Self> {
         let tls_config = make_server_tls_config().map_err(PyRuntimeError::new_err)?;
 
-        let listener = TcpListener::bind("[::]:0")
-            .map_err(|e| PyRuntimeError::new_err(format!("bind: {e}")))?;
+        // Use fixed port from MONARCH_TLS_PORT env var if set (for tunneled
+        // environments like kfair), otherwise bind to a random port.
+        let bind_addr = match std::env::var("MONARCH_TLS_PORT") {
+            Ok(p) => format!("[::]:{}",  p),
+            Err(_) => "[::]:0".to_string(),
+        };
+        let listener = TcpListener::bind(&bind_addr)
+            .map_err(|e| PyRuntimeError::new_err(format!("bind {bind_addr}: {e}")))?;
         let port = listener
             .local_addr()
             .map_err(|e| PyRuntimeError::new_err(format!("addr: {e}")))?
             .port();
 
-        let hostname = get_fqdn().map_err(PyRuntimeError::new_err)?;
+        let hostname = get_host().map_err(PyRuntimeError::new_err)?;
 
         Ok(TlsReceiver {
             addr: format!("{hostname}:{port}"),

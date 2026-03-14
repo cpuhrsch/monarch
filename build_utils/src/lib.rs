@@ -136,10 +136,21 @@ pub fn find_cuda_home() -> Option<String> {
                     cuda_home = Some(cuda_homes[0].to_string_lossy().into_owned());
                 }
             } else {
-                // Unix-like systems
-                let cuda_candidate = "/usr/local/cuda";
-                if Path::new(cuda_candidate).exists() {
-                    cuda_home = Some(cuda_candidate.to_string());
+                // Unix-like systems: try /usr/local/cuda first, then glob
+                // /usr/local/cuda* (e.g. /usr/local/cuda-12.4). Validate that
+                // the candidate has an include/ directory with actual headers.
+                let mut candidates: Vec<_> = glob("/usr/local/cuda*")
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|p| p.join("include").exists())
+                    .collect();
+                candidates.sort();
+                // Prefer /usr/local/cuda if valid, otherwise highest versioned
+                let plain = PathBuf::from("/usr/local/cuda");
+                if candidates.contains(&plain) {
+                    cuda_home = Some("/usr/local/cuda".to_string());
+                } else if let Some(best) = candidates.last() {
+                    cuda_home = Some(best.to_string_lossy().into_owned());
                 }
             }
         }

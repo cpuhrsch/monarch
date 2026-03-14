@@ -41,6 +41,7 @@ import fire
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RUN_SCRIPT = os.path.join(SCRIPT_DIR, "remoterun.sh")
+REMOTERUN_SCRIPT = os.path.join(SCRIPT_DIR, "remoterun.py")
 NUM_PY = 1000
 SCENARIOS = [
     "Cold start",
@@ -92,27 +93,45 @@ def _create_test_dir(base_dir, total_gb):
 
 
 def _run(
-    label, num_hosts, source_dir, script="#!/bin/bash\necho done\n", extra_args=None
+    label, num_hosts, source_dir, script="#!/bin/bash\necho done\n",
+    extra_args=None, backend="mast",
 ):
-    """Run remoterun via run.sh and return elapsed time."""
+    """Run remoterun and return elapsed time."""
     sys.stdout.write(f"  {label:.<40s}")
     sys.stdout.flush()
 
-    cmd = [
-        "bash",
-        RUN_SCRIPT,
-        source_dir,
-        "stdin",
-        "--num_hosts",
-        str(num_hosts),
-        "--gpus_per_host",
-        "1",
-    ]
+    if backend == "kfair":
+        cmd = [
+            sys.executable,
+            REMOTERUN_SCRIPT,
+            source_dir,
+            "stdin",
+            "--num_hosts",
+            str(num_hosts),
+            "--gpus_per_host",
+            "1",
+            "--backend",
+            "kfair",
+        ]
+    else:
+        cmd = [
+            "bash",
+            RUN_SCRIPT,
+            source_dir,
+            "stdin",
+            "--num_hosts",
+            str(num_hosts),
+            "--gpus_per_host",
+            "1",
+        ]
     if extra_args:
         cmd.extend(extra_args)
 
+    # For kfair, run from the kfair project dir where .kfair/state.json lives.
+    cwd = os.path.expanduser("~/k8s") if backend == "kfair" else None
+
     t0 = time.time()
-    result = subprocess.run(cmd, input=script, capture_output=True, text=True)
+    result = subprocess.run(cmd, input=script, capture_output=True, text=True, cwd=cwd)
     elapsed = time.time() - t0
 
     # Extract classification from logs.
@@ -177,14 +196,15 @@ def _run(
     return elapsed
 
 
-def _run_with_dummy(label, num_hosts, warmup_dir, script, extra_args=None):
+def _run_with_dummy(label, num_hosts, warmup_dir, script, extra_args=None, backend="mast"):
     """Run a script on workers using a tiny dummy source directory."""
     shutil.rmtree(warmup_dir, ignore_errors=True)
     os.makedirs(warmup_dir, exist_ok=True)
     with open(os.path.join(warmup_dir, "dummy.txt"), "w") as f:
         f.write("x\n")
     elapsed = _run(
-        label, num_hosts, source_dir=warmup_dir, script=script, extra_args=extra_args
+        label, num_hosts, source_dir=warmup_dir, script=script,
+        extra_args=extra_args, backend=backend,
     )
     shutil.rmtree(warmup_dir, ignore_errors=True)
     return elapsed
@@ -242,7 +262,7 @@ def _kill_job():
     print("  Done.")
 
 
-def _run_scenarios(num_hosts, size_gb, bench_dir, extra_args=None):
+def _run_scenarios(num_hosts, size_gb, bench_dir, extra_args=None, backend="mast"):
     """Run all 5 scenarios for a given payload size, return dict of times."""
     src_dir = os.path.join(bench_dir, "src")
     data_path = os.path.join(bench_dir, "data.bin")
@@ -250,12 +270,12 @@ def _run_scenarios(num_hosts, size_gb, bench_dir, extra_args=None):
 
     # 1. Cold start (cache was cleared before this call)
     results["Cold start"] = _run(
-        "Cold start", num_hosts, bench_dir, extra_args=extra_args
+        "Cold start", num_hosts, bench_dir, extra_args=extra_args, backend=backend
     )
 
     # 2. No change (cache hit from cold start)
     results["No change"] = _run(
-        "No change", num_hosts, bench_dir, extra_args=extra_args
+        "No change", num_hosts, bench_dir, extra_args=extra_args, backend=backend
     )
 
     # 3. Rewrite data.bin (same size -> partial update)
@@ -267,7 +287,7 @@ def _run_scenarios(num_hosts, size_gb, bench_dir, extra_args=None):
             f.write(os.urandom(chunk))
             remaining -= chunk
     results["Rewrite data.bin"] = _run(
-        "Rewrite data.bin", num_hosts, bench_dir, extra_args=extra_args
+        "Rewrite data.bin", num_hosts, bench_dir, extra_args=extra_args, backend=backend
     )
 
     # 4. Rewrite all .py files (partial update)
@@ -277,13 +297,13 @@ def _run_scenarios(num_hosts, size_gb, bench_dir, extra_args=None):
         with open(os.path.join(src_dir, f"mod_{i}.py"), "w") as f:
             f.write(f"# Modify {i}\n" * 50 + f"def func_{i}(): return {i}\n")
     results["Rewrite .py"] = _run(
-        "Rewrite .py files", num_hosts, bench_dir, extra_args=extra_args
+        "Rewrite .py files", num_hosts, bench_dir, extra_args=extra_args, backend=backend
     )
 
     # 5. Delete file (total size changes -> stale -> full transfer)
     os.remove(os.path.join(src_dir, "mod_0.py"))
     results["Delete file"] = _run(
-        "Delete file", num_hosts, bench_dir, extra_args=extra_args
+        "Delete file", num_hosts, bench_dir, extra_args=extra_args, backend=backend
     )
 
     return results
@@ -320,7 +340,7 @@ def _print_table(all_results):
     print()
 
 
-def _run_host_count(num_hosts, size_list, work_dir, extra_args=None):
+def _run_host_count(num_hosts, size_list, work_dir, extra_args=None, backend="mast"):
     """Run all payload sizes for a single host count.
 
     Uses work_dir for .monarch/job_state.pkl isolation and
@@ -340,29 +360,40 @@ def _run_host_count(num_hosts, size_list, work_dir, extra_args=None):
         print(f"  {num_hosts} host{'s' if num_hosts > 1 else ''}")
         print(f"{'=' * 60}")
 
-        _warmup(num_hosts, warmup_dir)
+        if backend != "kfair":
+            _warmup(num_hosts, warmup_dir)
 
         host_results = {}
         for size_gb in size_list:
             print(f"\n--- {size_gb}GB payload, {num_hosts} hosts ---")
             _create_test_dir(bench_dir, size_gb)
-            _clear_worker_cache(num_hosts, warmup_dir)
+            if backend != "kfair":
+                _clear_worker_cache(num_hosts, warmup_dir)
+            else:
+                _run_with_dummy(
+                    "clear cache",
+                    num_hosts,
+                    warmup_dir,
+                    "#!/bin/bash\nrm -rf /tmp/monarch_remotemount_cache/\necho cleared\n",
+                    backend=backend,
+                )
 
             results = _run_scenarios(
-                num_hosts, size_gb, bench_dir, extra_args=extra_args
+                num_hosts, size_gb, bench_dir, extra_args=extra_args, backend=backend
             )
             host_results[(num_hosts, size_gb)] = results
 
             shutil.rmtree(bench_dir, ignore_errors=True)
 
         _print_table(host_results)
-        _kill_job()
+        if backend != "kfair":
+            _kill_job()
         return host_results
     finally:
         os.chdir(orig_cwd)
 
 
-def main(host_type="gb200", sizes="1", hosts="2", streams=8):
+def main(host_type="gb200", sizes="1", hosts="2", streams=8, backend="mast"):
     """Run persistent cache benchmark across payload sizes and host counts.
 
     Args:
@@ -370,6 +401,7 @@ def main(host_type="gb200", sizes="1", hosts="2", streams=8):
         sizes: Comma-separated GB values (e.g., "1,2,4,8,16,32,64,128")
         hosts: Comma-separated host counts (e.g., "1,2,4,8,16")
         streams: Number of parallel TLS streams per host (default: 8)
+        backend: "mast", "slurm", or "kfair"
     """
     size_list = _parse_list(sizes)
     host_list = _parse_list(hosts)
@@ -379,7 +411,7 @@ def main(host_type="gb200", sizes="1", hosts="2", streams=8):
     os.environ["MONARCH_HOST_TYPE"] = host_type
 
     print("=" * 60)
-    print("  Persistent Cache Benchmark")
+    print(f"  Persistent Cache Benchmark (backend={backend})")
     print(f"  Sizes: {size_list} GB")
     print(f"  Hosts: {host_list}")
     print(f"  Streams: {streams}")
@@ -395,7 +427,7 @@ def main(host_type="gb200", sizes="1", hosts="2", streams=8):
         work_dir = os.path.join(base_work_dir, f"h{num_hosts}")
         try:
             host_results = _run_host_count(
-                num_hosts, size_list, work_dir, extra_args=extra_args
+                num_hosts, size_list, work_dir, extra_args=extra_args, backend=backend
             )
             all_results.update(host_results)
         except Exception as e:

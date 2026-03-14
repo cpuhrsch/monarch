@@ -96,8 +96,15 @@ def get_cuda_home() -> Optional[str]:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
-    # Check common locations
-    for path in ["/usr/local/cuda", "/usr/cuda"]:
+    # Check common locations (validate include/ exists with actual headers)
+    import glob as _glob
+
+    candidates = sorted(_glob.glob("/usr/local/cuda*"))
+    # Prefer /usr/local/cuda if it has headers, otherwise pick highest versioned
+    for path in candidates:
+        if os.path.isdir(os.path.join(path, "include")):
+            return path
+    for path in ["/usr/cuda"]:
         if os.path.exists(path):
             return path
 

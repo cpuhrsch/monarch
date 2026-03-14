@@ -16,9 +16,13 @@ import tempfile  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
+import json  # noqa: E402
+
 import cloudpickle  # noqa: E402
 import fire  # noqa: E402
 from monarch.actor import Actor, endpoint, this_host  # noqa: E402
+from monarch._src.actor.bootstrap import attach_to_workers  # noqa: E402
+from monarch._rust_bindings.monarch_hyperactor.channel import ChannelTransport  # noqa: E402
 from monarch.config import configure  # noqa: E402
 from monarch.job import SlurmJob  # noqa: E402
 from monarch.remotemount import remotemount  # noqa: E402
@@ -93,6 +97,14 @@ def _get_mast_host_mesh(
     return host_meshes.workers, {"job": job}
 
 
+def _ensure_preload():
+    """Re-exec with LD_PRELOAD=bind_override.so if not already loaded."""
+    bo = os.path.join(".kfair", "bind_override.so")
+    if os.path.exists(bo) and bo not in os.environ.get("LD_PRELOAD", ""):
+        os.environ["LD_PRELOAD"] = os.path.abspath(bo)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 def _cleanup_mast_job(job_info, host_mesh, kill_job):
     from monarch.actor import shutdown_context
 
@@ -145,16 +157,27 @@ def main(
     # gap, including mesh_attach_config_timeout (the push_config ack
     # during attach) and the spawn idle timeouts.
     t_configure_start = time.time()
-    configure(
-        enable_log_forwarding=True,
-        tail_log_lines=100,
-        host_spawn_ready_timeout="120s",
-        mesh_attach_config_timeout="120s",
-        mesh_proc_spawn_max_idle="120s",
-        actor_spawn_max_idle="120s",
-        message_delivery_timeout="600s",
-        rdma_max_chunk_size_mb=256,
-    )
+    if backend == "kfair":
+        _ensure_preload()
+        configure(
+            default_transport=ChannelTransport.TcpWithHostname,
+            enable_log_forwarding=True,
+            tail_log_lines=100,
+            mesh_proc_spawn_max_idle="120s",
+            actor_spawn_max_idle="120s",
+            message_delivery_timeout="600s",
+        )
+    else:
+        configure(
+            enable_log_forwarding=True,
+            tail_log_lines=100,
+            host_spawn_ready_timeout="120s",
+            mesh_attach_config_timeout="120s",
+            mesh_proc_spawn_max_idle="120s",
+            actor_spawn_max_idle="120s",
+            message_delivery_timeout="600s",
+            rdma_max_chunk_size_mb=256,
+        )
     t_configure_done = time.time()
     print(
         f"remoterun timings: import={t_main_start - _t_import_start:.2f}s, "
@@ -219,8 +242,22 @@ def main(
             f"remoterun timings: mast_reconnect={t_mast_done - t_mast_start:.2f}s",
             flush=True,
         )
+    elif backend == "kfair":
+        state_path = os.path.join(".kfair", "state.json")
+        with open(state_path) as f:
+            state = json.load(f)
+        workers_addrs = [
+            f"tcp://{w['ip']}:{state['monarch_port']}"
+            for w in state["workers"]
+        ]
+        host_mesh = attach_to_workers(
+            name="workers", ca="trust_all_connections", workers=workers_addrs
+        )
+        procs = host_mesh.spawn_procs(per_host={"gpus": gpus_per_host})
     else:
-        raise ValueError(f"Unknown backend: {backend}. Must be 'slurm' or 'mast'.")
+        raise ValueError(
+            f"Unknown backend: {backend}. Must be 'slurm', 'mast', or 'kfair'."
+        )
 
     if script == "stdin":
         script = sys.stdin.read()

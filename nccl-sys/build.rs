@@ -20,9 +20,10 @@ fn main() {
         .file("src/bridge.cpp")
         .flag("-std=c++14");
 
-    // Include CUDA headers
-    if let Some(cuda_home) = build_utils::find_cuda_home() {
-        cc_builder.include(format!("{}/include", cuda_home));
+    // Include CUDA headers (supports both old-style and new-style layouts)
+    let cuda_config = build_utils::discover_cuda_config().expect("CUDA not found");
+    for inc in &cuda_config.include_dirs {
+        cc_builder.include(inc);
     }
 
     cc_builder.compile("nccl_bridge");
@@ -95,9 +96,9 @@ fn main() {
             is_global: false,
         });
 
-    // Include CUDA headers
-    if let Some(cuda_home) = build_utils::find_cuda_home() {
-        builder = builder.clang_arg(format!("-I{}/include", cuda_home));
+    // Include CUDA headers (supports both old-style and new-style layouts)
+    for inc in &cuda_config.include_dirs {
+        builder = builder.clang_arg(format!("-I{}", inc.display()));
     }
 
     // Include headers and libs from the active environment

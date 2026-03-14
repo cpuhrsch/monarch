@@ -30,8 +30,7 @@ use crate::fast_pack::compute_block_hashes;
 use crate::fast_pack::mmap_anonymous;
 use crate::fast_pack::pack_files_into;
 
-const CA_PATH: &str = "/var/facebook/rootcanal/ca.pem";
-const CERT_PATH: &str = "/var/facebook/x509_identities/server.pem";
+const DEFAULT_CERT_PATH: &str = "/var/facebook/x509_identities/server.pem";
 
 /// Accepts any server certificate.
 ///
@@ -81,44 +80,48 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 fn make_tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let ca_pem = std::fs::read(CA_PATH).map_err(|e| format!("read {CA_PATH} failed: {e}"))?;
-    let cert_pem = std::fs::read(CERT_PATH).map_err(|e| format!("read {CERT_PATH} failed: {e}"))?;
+    let cert_path = std::env::var("MONARCH_TLS_CERT_PATH").unwrap_or_else(|_| DEFAULT_CERT_PATH.to_string());
 
-    let mut root_store = rustls::RootCertStore::empty();
-    let ca_certs = rustls_pemfile::certs(&mut BufReader::new(&ca_pem[..]))
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>();
-    root_store.add_parsable_certificates(ca_certs);
+    // Build client config. Use client auth certs if available (Meta infra),
+    // otherwise connect without client auth (the receiver uses
+    // with_no_client_auth so this is fine).
+    let config = if let Ok(cert_pem) = std::fs::read(&cert_path) {
+        let certs = rustls_pemfile::certs(&mut BufReader::new(&cert_pem[..]))
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
 
-    let certs = rustls_pemfile::certs(&mut BufReader::new(&cert_pem[..]))
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>();
-
-    let key = {
-        let mut reader = BufReader::new(&cert_pem[..]);
-        loop {
-            match rustls_pemfile::read_one(&mut reader) {
-                Ok(Some(rustls_pemfile::Item::Pkcs1Key(k))) => {
-                    break rustls::pki_types::PrivateKeyDer::Pkcs1(k);
+        let key = {
+            let mut reader = BufReader::new(&cert_pem[..]);
+            loop {
+                match rustls_pemfile::read_one(&mut reader) {
+                    Ok(Some(rustls_pemfile::Item::Pkcs1Key(k))) => {
+                        break rustls::pki_types::PrivateKeyDer::Pkcs1(k);
+                    }
+                    Ok(Some(rustls_pemfile::Item::Pkcs8Key(k))) => {
+                        break rustls::pki_types::PrivateKeyDer::Pkcs8(k);
+                    }
+                    Ok(Some(rustls_pemfile::Item::Sec1Key(k))) => {
+                        break rustls::pki_types::PrivateKeyDer::Sec1(k);
+                    }
+                    Ok(Some(_)) => continue,
+                    Ok(None) => return Err(format!("no private key found in {cert_path}")),
+                    Err(e) => return Err(format!("parse {cert_path} failed: {e}")),
                 }
-                Ok(Some(rustls_pemfile::Item::Pkcs8Key(k))) => {
-                    break rustls::pki_types::PrivateKeyDer::Pkcs8(k);
-                }
-                Ok(Some(rustls_pemfile::Item::Sec1Key(k))) => {
-                    break rustls::pki_types::PrivateKeyDer::Sec1(k);
-                }
-                Ok(Some(_)) => continue,
-                Ok(None) => return Err(format!("no private key found in {CERT_PATH}")),
-                Err(e) => return Err(format!("parse {CERT_PATH} failed: {e}")),
             }
-        }
-    };
+        };
 
-    let config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerifier))
-        .with_client_auth_cert(certs, key)
-        .map_err(|e| format!("client auth cert failed: {e}"))?;
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| format!("client auth cert failed: {e}"))?
+    } else {
+        // No client certs available — connect without client auth.
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth()
+    };
 
     Ok(Arc::new(config))
 }
