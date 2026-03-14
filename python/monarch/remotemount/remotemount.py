@@ -468,6 +468,10 @@ class FUSEActor(Actor):
 
         # Allocate storage if not already present, or resize if needed.
         if self._chunk_storage is None or self._total_size != total_size:
+            # Release existing memoryview/chunks before closing old mmap.
+            self._chunk_storage_mv = None
+            self.chunks = []
+            self._chunk_offsets = None
             if self._cache_path:
                 # Resize without O_TRUNC to preserve existing cached blocks.
                 fd = os.open(
