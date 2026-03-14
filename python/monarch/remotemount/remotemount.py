@@ -52,14 +52,23 @@ def classify_workers(client_hashes, client_total_size, worker_states):
     for rank, (remote_hashes, remote_size) in enumerate(worker_states):
         if remote_hashes == client_hashes and remote_size == client_total_size:
             fresh_ranks.append(rank)
-        elif remote_size == client_total_size and len(remote_hashes) == len(
-            client_hashes
-        ):
+        elif remote_hashes:
+            # Partial: compare overlapping blocks, mark new/changed as dirty.
+            min_blocks = min(len(remote_hashes), len(client_hashes))
             dirty = [
                 i
-                for i, (a, b) in enumerate(zip(client_hashes, remote_hashes))
-                if a != b
+                for i in range(min_blocks)
+                if remote_hashes[i] != client_hashes[i]
             ]
+            # Any blocks beyond the old count are new and need transfer.
+            dirty.extend(range(min_blocks, len(client_hashes)))
+            # If size changed, the last overlapping block likely changed
+            # (partial block at the boundary may have different content).
+            if remote_size != client_total_size and min_blocks > 0:
+                last = min_blocks - 1
+                if last not in dirty:
+                    dirty.append(last)
+                    dirty.sort()
             worker_dirty[rank] = dirty
         else:
             worker_dirty[rank] = None
@@ -457,14 +466,17 @@ class FUSEActor(Actor):
 
         from monarch._rust_bindings.monarch_extension.tls_receiver import TlsReceiver
 
-        # Allocate storage if not already present.
+        # Allocate storage if not already present, or resize if needed.
         if self._chunk_storage is None or self._total_size != total_size:
             if self._cache_path:
+                # Resize without O_TRUNC to preserve existing cached blocks.
                 fd = os.open(
-                    self._cache_path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600
+                    self._cache_path, os.O_RDWR | os.O_CREAT, 0o600
                 )
                 try:
                     os.ftruncate(fd, total_size)
+                    if self._chunk_storage is not None:
+                        self._chunk_storage.close()
                     self._chunk_storage = mmap.mmap(fd, total_size)
                 finally:
                     os.close(fd)
