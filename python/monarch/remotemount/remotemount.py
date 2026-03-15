@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 CHUNK_SIZE = (1024 * 1024 * 1024) * 8
 HASH_BLOCK_SIZE = 64 * 1024 * 1024  # 64MB blocks for incremental diffing
 CACHE_DIR = "/tmp/monarch_remotemount_cache"
+FRAG_THRESHOLD = 0.2  # max dead-space ratio before sequential repack
 
 
 def block_hashes(data_mv, block_size=HASH_BLOCK_SIZE):
@@ -37,7 +38,8 @@ def classify_workers(client_hashes, client_total_size, worker_states):
     """Classify workers as fresh, partial, or stale.
 
     Args:
-        client_hashes: list of block hash strings from client
+        client_hashes: list of block hash strings (or None for assumed-clean
+            blocks in incremental mode) from client
         client_total_size: total packed data size on client
         worker_states: list of (remote_hashes, remote_size) tuples
 
@@ -50,23 +52,38 @@ def classify_workers(client_hashes, client_total_size, worker_states):
     fresh_ranks = []
     worker_dirty = {}
     for rank, (remote_hashes, remote_size) in enumerate(worker_states):
-        if remote_hashes == client_hashes and remote_size == client_total_size:
+        if (
+            remote_hashes
+            and len(remote_hashes) == len(client_hashes)
+            and remote_size == client_total_size
+            and all(
+                ch is None or ch == rh
+                for ch, rh in zip(client_hashes, remote_hashes)
+            )
+        ):
             fresh_ranks.append(rank)
         elif remote_hashes:
             # Partial: compare overlapping blocks, mark new/changed as dirty.
+            # Skip blocks where client hash is None (assumed unchanged in
+            # incremental mode).
             min_blocks = min(len(remote_hashes), len(client_hashes))
             dirty = [
                 i
                 for i in range(min_blocks)
-                if remote_hashes[i] != client_hashes[i]
+                if client_hashes[i] is not None
+                and remote_hashes[i] != client_hashes[i]
             ]
-            # Any blocks beyond the old count are new and need transfer.
-            dirty.extend(range(min_blocks, len(client_hashes)))
+            # Any new blocks beyond the old count that have real hashes.
+            dirty.extend(
+                i
+                for i in range(min_blocks, len(client_hashes))
+                if client_hashes[i] is not None
+            )
             # If size changed, the last overlapping block likely changed
             # (partial block at the boundary may have different content).
             if remote_size != client_total_size and min_blocks > 0:
                 last = min_blocks - 1
-                if last not in dirty:
+                if last not in dirty and client_hashes[last] is not None:
                     dirty.append(last)
                     dirty.sort()
             worker_dirty[rank] = dirty
@@ -75,25 +92,107 @@ def classify_workers(client_hashes, client_total_size, worker_states):
     return fresh_ranks, worker_dirty
 
 
-def pack_directory_chunked(source_path, chunk_size=None, use_shm=False):
+def _load_pack_index(path):
+    """Load JSON pack index from disk. Returns dict or None."""
+    import json
+
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _save_pack_index(path, index_data):
+    """Write pack index as JSON."""
+    import json
+
+    try:
+        with open(path, "w") as f:
+            json.dump(index_data, f)
+    except OSError:
+        logger.warning(f"Failed to save pack index to {path}", exc_info=True)
+
+
+def _compute_file_hashes(staging_mv, file_entries, offset_map):
+    """Compute xxh64 per file from packed buffer. Returns {vpath: hash_hex}."""
+    import xxhash
+
+    hashes = {}
+    for vpath, _full_path, file_len, _mtime_ns in file_entries:
+        offset = offset_map[vpath]
+        # Hash directly from memoryview slice — avoids a full bytes() copy.
+        hashes[vpath] = xxhash.xxh64(
+            staging_mv[offset : offset + file_len]
+        ).hexdigest()
+    return hashes
+
+
+def _assign_offsets(file_entries, previous_index):
+    """Append-only offset assignment.
+
+    Unchanged files keep their original offsets. Changed/new files are
+    appended after the previous total size.
+
+    Args:
+        file_entries: [(vpath, full_path, file_len, mtime_ns), ...]
+        previous_index: dict with 'total_size' and 'files' keys
+
+    Returns:
+        (offset_map, new_total_size, dead_space)
+    """
+    prev_files = previous_index.get("files", {})
+    prev_total = previous_index.get("total_size", 0)
+
+    offset_map = {}
+    dead_space = 0
+    append_offset = prev_total
+
+    current_vpaths = set()
+    for vpath, _full_path, file_len, mtime_ns in file_entries:
+        current_vpaths.add(vpath)
+        prev = prev_files.get(vpath)
+        if prev and prev["size"] == file_len and prev["mtime_ns"] == mtime_ns:
+            # File unchanged — keep old offset
+            offset_map[vpath] = prev["offset"]
+        else:
+            # File changed or new — append at the end
+            if prev:
+                dead_space += prev["size"]
+            offset_map[vpath] = append_offset
+            append_offset += file_len
+
+    # Deleted files contribute dead space
+    for vpath, info in prev_files.items():
+        if vpath not in current_vpaths:
+            dead_space += info["size"]
+
+    return offset_map, append_offset, dead_space
+
+
+def pack_directory_chunked(source_path, chunk_size=None, use_shm=False, previous_index=None):
     """Walk a directory, pack all files into contiguous mmap chunks.
 
-    Returns (fs_metadata, staging_mv, chunks, shm_path, block_hashes_list)
+    When *previous_index* is provided (from a prior run's pack index), files
+    whose ``(mtime_ns, size)`` match the index keep their original offsets and
+    changed/new files are appended at the end of the buffer.  If the resulting
+    dead-space ratio exceeds ``FRAG_THRESHOLD``, the layout falls back to
+    sequential packing.
+
+    Returns (fs_metadata, staging_mv, chunks, shm_path, block_hashes_list, pack_index)
     where:
     - fs_metadata: dict mapping virtual paths to stat/offset metadata
     - staging_mv: memoryview over the packed data
     - chunks: list of chunk-sized memoryview slices
     - shm_path: path to named pack file if use_shm=True, else None
-    - block_hashes_list: list of xxh64 hex digest strings per 100 MB block
+    - block_hashes_list: list of xxh64 hex digest strings per 64 MB block
+    - pack_index: dict with per-file offset/size/mtime/hash for incremental packing
     """
     if chunk_size is None:
         chunk_size = CHUNK_SIZE
 
     fs_metadata = {}
-    file_list = []
-
-    # Tracks the virtual address of the filesystem
-    current_global_offset = 0
+    file_entries = []  # [(vpath, full_path, file_len, mtime_ns)]
 
     source_path = os.path.abspath(source_path)
 
@@ -147,6 +246,7 @@ def pack_directory_chunked(source_path, chunk_size=None, use_shm=False):
                 }
             else:
                 file_len = lst.st_size
+                mtime_ns = lst.st_mtime_ns
                 attr = {
                     key: getattr(lst, key)
                     for key in (
@@ -162,32 +262,83 @@ def pack_directory_chunked(source_path, chunk_size=None, use_shm=False):
                 }
                 attr["st_size"] = file_len
 
+                # Defer global_offset — assigned after offset-assignment phase.
                 fs_metadata[virtual_path] = {
                     "attr": attr,
-                    "global_offset": current_global_offset,
                     "file_len": file_len,
                 }
 
-                file_list.append((full_path, current_global_offset, file_len))
-                # Tracks the virtual address of the filesystem
-                current_global_offset += file_len
+                file_entries.append((virtual_path, full_path, file_len, mtime_ns))
 
-    total_size = current_global_offset
+    # --- Offset assignment phase ---
+    use_append = False
+    if previous_index and previous_index.get("files"):
+        offset_map, total_size, dead_space = _assign_offsets(
+            file_entries, previous_index
+        )
+        if total_size > 0 and dead_space / total_size > FRAG_THRESHOLD:
+            logger.info(
+                f"Fragmentation {dead_space / total_size:.1%} exceeds threshold "
+                f"{FRAG_THRESHOLD:.0%}, repacking sequentially"
+            )
+        else:
+            n_reused = sum(
+                1
+                for vpath, _, flen, mns in file_entries
+                if previous_index["files"].get(vpath, {}).get("size") == flen
+                and previous_index["files"].get(vpath, {}).get("mtime_ns") == mns
+            )
+            logger.info(
+                f"Append-only layout: {n_reused}/{len(file_entries)} files reused, "
+                f"dead_space={dead_space // 1024}KiB "
+                f"({dead_space / total_size:.1%} of {total_size // (1024**2)}MiB)"
+            )
+            use_append = True
+
+    if not use_append:
+        # Sequential offsets (current behavior)
+        offset_map = {}
+        current_offset = 0
+        for vpath, _full_path, file_len, _mtime_ns in file_entries:
+            offset_map[vpath] = current_offset
+            current_offset += file_len
+        total_size = current_offset
+
+    # Set global_offset in fs_metadata and build file_list for Rust packer.
+    file_list = []
+    for vpath, full_path, file_len, _mtime_ns in file_entries:
+        fs_metadata[vpath]["global_offset"] = offset_map[vpath]
+        file_list.append((full_path, offset_map[vpath], file_len))
+
     logger.info(f"Packing {total_size // (1024**2)}MiB, {len(file_list)} files")
 
     if total_size == 0:
-        return fs_metadata, None, [], None, []
+        return fs_metadata, None, [], None, [], None
 
-    if use_shm:
-        staging_mv, shm_path, hashes = _c_pack_files_to_shm(file_list, total_size)
-    else:
-        staging_mv, hashes = _c_pack_files(file_list, total_size)
-        shm_path = None
+    # Always use anonymous mmap (no /tmp file write needed for TLS transfer).
+    staging_mv, hashes = _c_pack_files(file_list, total_size)
+    shm_path = None
+
     chunks = [
         staging_mv[i : i + chunk_size] for i in range(0, len(staging_mv), chunk_size)
     ]
 
-    return fs_metadata, staging_mv, chunks, shm_path, list(hashes)
+    # Compute per-file content hashes and build pack index.
+    file_hashes = _compute_file_hashes(staging_mv, file_entries, offset_map)
+    new_pack_index = {
+        "total_size": total_size,
+        "files": {
+            vpath: {
+                "offset": offset_map[vpath],
+                "size": file_len,
+                "mtime_ns": mtime_ns,
+                "content_hash": file_hashes[vpath],
+            }
+            for vpath, _full_path, file_len, mtime_ns in file_entries
+        },
+    }
+
+    return fs_metadata, staging_mv, chunks, shm_path, list(hashes), new_pack_index
 
 
 class FUSEActor(Actor):
@@ -204,6 +355,7 @@ class FUSEActor(Actor):
         self._fuse_handle = None
         self._cache_path = None
         self._tls_receiver = None
+        self._pack_index = {}
 
     @endpoint
     def try_load_cache(self, cache_key):
@@ -231,6 +383,9 @@ class FUSEActor(Actor):
                     self._chunk_storage_mv = memoryview(self._chunk_storage)
                     self._total_size = size
                     self._block_hashes = block_hashes(self._chunk_storage_mv)
+                    self._pack_index = (
+                        _load_pack_index(self._cache_path + ".index") or {}
+                    )
 
                     # Build chunks list so mount() works with cached data.
                     self.chunks = []
@@ -421,7 +576,7 @@ class FUSEActor(Actor):
             rdma_buffer.read_into(dst_mv, timeout=timeout).get()
 
     @endpoint
-    def mount(self, mount_point, new_block_hashes=None, total_size=0):
+    def mount(self, mount_point, new_block_hashes=None, total_size=0, pack_index=None):
         import json
 
         from monarch._rust_bindings.monarch_extension.chunked_fuse import (
@@ -434,6 +589,11 @@ class FUSEActor(Actor):
                 self._chunk_storage.flush()
             except Exception:
                 pass
+
+        # Persist pack index alongside cached data.
+        if pack_index is not None and self._cache_path:
+            self._pack_index = pack_index
+            _save_pack_index(self._cache_path + ".index", pack_index)
 
         self._fuse_handle = mount_chunked_fuse(
             json.dumps(self.meta),
@@ -449,6 +609,11 @@ class FUSEActor(Actor):
     def get_block_hashes(self):
         """Return per-block hashes and total size of the mounted data."""
         return (self._block_hashes, self._total_size)
+
+    @endpoint
+    def get_pack_index(self):
+        """Return the pack index for append-only packing."""
+        return self._pack_index
 
     @endpoint
     def get_cache_path(self):
@@ -552,7 +717,7 @@ class MountHandler:
         t_open_start = time.time()
 
         # Reuse existing actors if available (preserves block hashes
-        # for incremental update checks).
+        # and pack index for incremental update checks).
         if self.fuse_actors is None:
             self.procs = self.host_mesh.spawn_procs(per_host={"gpus": 1})
             self.fuse_actors = self.procs.spawn(
@@ -569,14 +734,38 @@ class MountHandler:
 
         t_actors_ready = time.time()
 
-        # Fire get_block_hashes before packing so the network round-trip
-        # overlaps with the CPU-bound pack+hash step.
+        # Fire RPCs before packing so the network round-trips overlap
+        # with the CPU-bound walk+pack+hash step.
         flat_actors = self.fuse_actors.flatten("rank")
         num_workers = len(flat_actors)
         hashes_future = self.fuse_actors.get_block_hashes.call()
+        index_future = self.fuse_actors.get_pack_index.call()
 
-        meta, self._staging_mv, chunks, self._pack_shm_path, client_hashes = (
-            pack_directory_chunked(self.sourcepath, self.chunk_size, use_shm=True)
+        # Get pack index from workers (first non-empty).
+        # This is small JSON so the wait is fast.
+        try:
+            index_result = index_future.get()
+            previous_index = next(
+                (idx for _, idx in index_result if idx and idx.get("files")),
+                None,
+            )
+        except Exception:
+            previous_index = None
+
+        t_index_ready = time.time()
+
+        (
+            meta,
+            self._staging_mv,
+            chunks,
+            self._pack_shm_path,
+            client_hashes,
+            new_pack_index,
+        ) = pack_directory_chunked(
+            self.sourcepath,
+            self.chunk_size,
+            use_shm=False,
+            previous_index=previous_index,
         )
         staging_mv = self._staging_mv
         client_total_size = len(staging_mv) if staging_mv is not None else 0
@@ -607,14 +796,22 @@ class MountHandler:
         t_meta_done = time.time()
 
         if not worker_dirty:
+            # Lazy-unmount any stale FUSE left by a killed process.
+            try:
+                self.fuse_actors.run_commands.call(
+                    ["fusermount3", "-uz", self.mntpoint]
+                ).get()
+            except Exception:
+                pass
             self.fuse_actors.mount.call(
-                self.mntpoint, client_hashes, client_total_size
+                self.mntpoint, client_hashes, client_total_size, new_pack_index
             ).get()
             t_mount_done = time.time()
             logger.info(
                 f"All {num_workers} workers up-to-date — skipping transfer, re-mounting. "
                 f"Timings: actors={t_actors_ready - t_open_start:.2f}s, "
-                f"pack+hash={t_pack_done - t_actors_ready:.2f}s "
+                f"get_index={t_index_ready - t_actors_ready:.2f}s, "
+                f"pack+hash={t_pack_done - t_index_ready:.2f}s "
                 f"({client_total_size / (1024**2):.0f}MiB), "
                 f"classify={t_classify_done - t_pack_done:.2f}s, "
                 f"set_meta={t_meta_done - t_classify_done:.2f}s, "
@@ -630,11 +827,12 @@ class MountHandler:
             f"{n_stale} stale out of {num_workers} workers"
         )
 
-        # Unmount workers that need updating.
+        # Unmount workers that need updating.  Use lazy unmount (-uz) so
+        # stale mounts from killed processes are cleaned up.
         for rank in worker_dirty:
             try:
                 flat_actors.slice(rank=rank).run_commands.call(
-                    ["fusermount3", "-u", self.mntpoint]
+                    ["fusermount3", "-uz", self.mntpoint]
                 ).get()
             except Exception:
                 pass
@@ -673,14 +871,15 @@ class MountHandler:
 
         # Remount all workers (fresh ones for metadata update).
         self.fuse_actors.mount.call(
-            self.mntpoint, client_hashes, client_total_size
+            self.mntpoint, client_hashes, client_total_size, new_pack_index
         ).get()
 
         t_mount_done = time.time()
 
         logger.info(
             f"open() timings: actors={t_actors_ready - t_open_start:.2f}s, "
-            f"pack+hash={t_pack_done - t_actors_ready:.2f}s "
+            f"get_index={t_index_ready - t_actors_ready:.2f}s, "
+            f"pack+hash={t_pack_done - t_index_ready:.2f}s "
             f"({client_total_size / (1024**2):.0f}MiB), "
             f"classify={t_classify_done - t_pack_done:.2f}s, "
             f"set_meta={t_meta_done - t_classify_done:.2f}s, "
@@ -697,6 +896,10 @@ class MountHandler:
 
         Sends blocks directly from ``self._staging_mv`` (the buffer produced
         by ``pack_directory_chunked``) so no second pack step is needed.
+
+        Retries once on failure — the relay tunnel can lose data on transient
+        kubectl port-forward hiccups (sender writes succeed because data fits
+        in the local TCP buffer, but the relay doesn't deliver it all).
 
         Flow:
           1. Worker: prepare_receiver() → creates TlsReceiver, returns address
@@ -723,24 +926,38 @@ class MountHandler:
             for bi in dirty_blocks
         )
 
-        # 1. Start receiver on worker.
-        t_start = time.time()
-        addr_result = fuse_actor.prepare_receiver.call(num_streams, total_size).get()
-        addr = [v for _, v in addr_result][0]
-        addresses = [addr] * num_streams
+        max_attempts = 2
+        for attempt in range(max_attempts):
+            # 1. Start receiver on worker.
+            t_start = time.time()
+            addr_result = fuse_actor.prepare_receiver.call(num_streams, total_size).get()
+            addr = [v for _, v in addr_result][0]
+            addresses = [addr] * num_streams
 
-        # 2. Fire receive_blocks (non-blocking) so worker starts waiting.
-        recv_future = fuse_actor.receive_blocks.call()
+            # 2. Fire receive_blocks (non-blocking) so worker starts waiting.
+            recv_future = fuse_actor.receive_blocks.call()
 
-        # 3. Send blocks directly from the staging buffer.
-        t_setup = time.time()
-        send_blocks_from_buffer(
-            self._staging_mv, total_size, dirty_blocks, addresses, cache_path
-        )
-        t_send = time.time()
+            # 3. Send blocks directly from the staging buffer.
+            t_setup = time.time()
+            send_blocks_from_buffer(
+                self._staging_mv, total_size, dirty_blocks, addresses, cache_path
+            )
+            t_send = time.time()
 
-        # 4. Wait for receiver to finish.
-        recv_future.get()
+            # 4. Wait for receiver to finish.
+            try:
+                recv_future.get()
+            except Exception:
+                if attempt < max_attempts - 1:
+                    logger.warning(
+                        f"TLS transfer failed (attempt {attempt + 1}/{max_attempts}), "
+                        f"retrying...",
+                        exc_info=True,
+                    )
+                    continue
+                raise
+            break
+
         t_done = time.time()
 
         gbps = (total_bytes * 8.0 / 1e9) / max(t_send - t_setup, 1e-9)
@@ -807,7 +1024,7 @@ class MountHandler:
         if self.fuse_actors is not None:
             try:
                 self.fuse_actors.run_commands.call(
-                    ["fusermount3", "-u", self.mntpoint]
+                    ["fusermount3", "-uz", self.mntpoint]
                 ).get()
             except Exception:
                 pass
