@@ -191,10 +191,42 @@ fn send_blocks_impl(
                     .parse()
                     .map_err(|e| format!("invalid port in {addr}: {e}"))?;
 
-                let tcp =
-                    TcpStream::connect((host, port)).map_err(|e| format!("connect {addr}: {e}"))?;
+                // Retry connect — kubectl port-forwards can take a moment
+                // to establish their SPDY streams.
+                let tcp = {
+                    let mut last_err = String::new();
+                    let mut conn = None;
+                    for attempt in 0..10 {
+                        match TcpStream::connect((host, port)) {
+                            Ok(s) => { conn = Some(s); break; }
+                            Err(e) => {
+                                last_err = format!("connect {addr}: {e}");
+                                if attempt < 9 {
+                                    std::thread::sleep(std::time::Duration::from_millis(500));
+                                }
+                            }
+                        }
+                    }
+                    conn.ok_or(last_err)?
+                };
                 tcp.set_nodelay(true)
                     .map_err(|e| format!("set_nodelay: {e}"))?;
+
+                // 4 MB send buffer for high-bandwidth transfers.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let bufsize: libc::c_int = 4 * 1024 * 1024;
+                    unsafe {
+                        libc::setsockopt(
+                            tcp.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            libc::SO_SNDBUF,
+                            &bufsize as *const _ as *const libc::c_void,
+                            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                        );
+                    }
+                }
 
                 let server_name = ServerName::try_from(host.to_string())
                     .unwrap_or_else(|_| ServerName::try_from("localhost".to_string()).unwrap());

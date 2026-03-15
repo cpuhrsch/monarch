@@ -174,6 +174,22 @@ impl TlsReceiver {
                         let (tcp, _) = listener_ref.accept().map_err(|e| format!("accept: {e}"))?;
                         tcp.set_nodelay(true).ok();
 
+                        // 4 MB receive buffer for high-bandwidth transfers.
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::io::AsRawFd;
+                            let bufsize: libc::c_int = 4 * 1024 * 1024;
+                            unsafe {
+                                libc::setsockopt(
+                                    tcp.as_raw_fd(),
+                                    libc::SOL_SOCKET,
+                                    libc::SO_RCVBUF,
+                                    &bufsize as *const _ as *const libc::c_void,
+                                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                                );
+                            }
+                        }
+
                         let conn = rustls::ServerConnection::new(cfg)
                             .map_err(|e| format!("TLS accept: {e}"))?;
                         let mut tls = rustls::StreamOwned::new(conn, tcp);

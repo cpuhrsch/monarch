@@ -11,6 +11,7 @@ import time
 from typing import Optional
 
 from monarch._rust_bindings.monarch_extension.fast_pack import (
+    load_file_into_buffer as _c_load_file_into_buffer,
     pack_files_to_shm as _c_pack_files_to_shm,
     pack_files_with_offsets as _c_pack_files,
 )
@@ -356,6 +357,8 @@ class FUSEActor(Actor):
         self._cache_path = None
         self._tls_receiver = None
         self._pack_index = {}
+        self._rdma_staging = None
+        self._rdma_staging_mv = None
 
     @endpoint
     def try_load_cache(self, cache_key):
@@ -382,7 +385,9 @@ class FUSEActor(Actor):
                         os.close(fd)
                     self._chunk_storage_mv = memoryview(self._chunk_storage)
                     self._total_size = size
-                    self._block_hashes = block_hashes(self._chunk_storage_mv)
+                    self._block_hashes = list(
+                        _c_load_file_into_buffer(self._cache_path, self._chunk_storage_mv)
+                    )
                     self._pack_index = (
                         _load_pack_index(self._cache_path + ".index") or {}
                     )
@@ -556,23 +561,102 @@ class FUSEActor(Actor):
         )
 
     @endpoint
+    def get_block_rdma_buffer(self, block_idx, total_size):
+        """Copy a block into a reusable anonymous staging buffer and return an RDMABuffer.
+
+        Uses a single 64MB anonymous mmap that is reused across calls.
+        The caller MUST wait for all peers to finish reading before
+        calling this again (the staging buffer is overwritten each time).
+        """
+        import mmap as _mmap
+
+        from monarch.rdma import RDMABuffer
+
+        block_size = min(HASH_BLOCK_SIZE, total_size - block_idx * HASH_BLOCK_SIZE)
+        offset = block_idx * HASH_BLOCK_SIZE
+
+        # Allocate staging once, reuse for all blocks.
+        if self._rdma_staging is None:
+            self._rdma_staging = _mmap.mmap(
+                -1, HASH_BLOCK_SIZE, _mmap.MAP_PRIVATE | _mmap.MAP_ANONYMOUS
+            )
+            self._rdma_staging_mv = memoryview(self._rdma_staging)
+
+        # Copy block data into anonymous staging buffer.
+        staging_slice = self._rdma_staging_mv[:block_size]
+        staging_slice[:] = self._chunk_storage_mv[offset : offset + block_size]
+
+        return RDMABuffer(staging_slice)
+
+    @endpoint
+    def ensure_storage(self, total_size):
+        """Ensure storage is allocated at the given size for RDMA reception."""
+        import mmap as _mmap
+
+        if self._chunk_storage is not None and self._total_size == total_size:
+            return
+
+        self._chunk_storage_mv = None
+        self.chunks = []
+        self._chunk_offsets = None
+
+        if self._cache_path:
+            fd = os.open(self._cache_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                os.ftruncate(fd, total_size)
+                if self._chunk_storage is not None:
+                    self._chunk_storage.close()
+                self._chunk_storage = _mmap.mmap(fd, total_size)
+            finally:
+                os.close(fd)
+        else:
+            if self._chunk_storage is not None:
+                self._chunk_storage.close()
+            self._chunk_storage = _mmap.mmap(
+                -1, total_size, _mmap.MAP_PRIVATE | _mmap.MAP_ANONYMOUS
+            )
+
+        self._chunk_storage_mv = memoryview(self._chunk_storage)
+        self._total_size = total_size
+
+        self.chunks = []
+        self._chunk_offsets = []
+        remaining = total_size
+        off = 0
+        while remaining > 0:
+            sz = min(remaining, self.chunk_size)
+            self._chunk_offsets.append((off, sz))
+            self.chunks.append(self._chunk_storage_mv[off : off + sz])
+            off += sz
+            remaining -= sz
+        self._next_chunk_idx = len(self._chunk_offsets)
+
+    @endpoint
     def replace_block(
         self, block_idx: int, rdma_buffer, block_size: int, timeout: int = 300
     ):
-        """Overwrite a single hash block in existing storage via RDMA."""
+        """Overwrite a single hash block in existing storage via RDMA.
+
+        Uses a reusable anonymous staging buffer to avoid registering
+        file-backed MAP_SHARED pages with ibv_reg_mr (which crashes).
+        """
         import mmap as _mmap
 
         offset = block_idx * HASH_BLOCK_SIZE
-        dst_mv = self._chunk_storage_mv[offset : offset + block_size]
 
         if self._cache_path:
-            # Don't explicitly close the anonymous mmap — it can raise
-            # BufferError if the Rust RDMABuffer still holds a reference.
-            anon = _mmap.mmap(-1, block_size, _mmap.MAP_PRIVATE | _mmap.MAP_ANONYMOUS)
-            anon_mv = memoryview(anon)
-            rdma_buffer.read_into(anon_mv, timeout=timeout).get()
-            dst_mv[:] = anon_mv
+            # Allocate staging once, reuse for all blocks.
+            if self._rdma_staging is None:
+                self._rdma_staging = _mmap.mmap(
+                    -1, HASH_BLOCK_SIZE, _mmap.MAP_PRIVATE | _mmap.MAP_ANONYMOUS
+                )
+                self._rdma_staging_mv = memoryview(self._rdma_staging)
+
+            staging_slice = self._rdma_staging_mv[:block_size]
+            rdma_buffer.read_into(staging_slice, timeout=timeout).get()
+            self._chunk_storage_mv[offset : offset + block_size] = staging_slice
         else:
+            dst_mv = self._chunk_storage_mv[offset : offset + block_size]
             rdma_buffer.read_into(dst_mv, timeout=timeout).get()
 
     @endpoint
@@ -696,6 +780,7 @@ class MountHandler:
         chunk_size=None,
         backend: str = "slurm",
         num_parallel_streams: int = 8,
+        tls_addresses=None,
     ):
         self.sourcepath = sourcepath
         if mntpoint is None:
@@ -711,6 +796,7 @@ class MountHandler:
                 f"num_parallel_streams must be >= 1, got {num_parallel_streams}"
             )
         self.num_parallel_streams = num_parallel_streams
+        self.tls_addresses = tls_addresses
         self._staging_mv = None
 
     def open(self):
@@ -782,6 +868,26 @@ class MountHandler:
             fresh_ranks, worker_dirty = classify_workers(
                 client_hashes, client_total_size, worker_states
             )
+            # Debug: log hash comparison details
+            for rank, (rh, rs) in enumerate(worker_states):
+                if rh:
+                    mismatches = [
+                        i for i in range(min(len(rh), len(client_hashes)))
+                        if client_hashes[i] != rh[i]
+                    ]
+                    logger.info(
+                        f"[DEBUG] worker {rank}: "
+                        f"client_size={client_total_size} worker_size={rs} "
+                        f"client_blocks={len(client_hashes)} worker_blocks={len(rh)} "
+                        f"mismatched={len(mismatches)}/{min(len(rh), len(client_hashes))} "
+                        f"first_mismatch={mismatches[:3] if mismatches else 'none'}"
+                    )
+                    if mismatches:
+                        i = mismatches[0]
+                        logger.info(
+                            f"[DEBUG] block {i}: client={client_hashes[i][:16]} "
+                            f"worker={rh[i][:16]}"
+                        )
         except Exception as e:
             logger.info(f"Block hash query failed: {e}")
             fresh_ranks = []
@@ -839,33 +945,36 @@ class MountHandler:
 
         t_unmount_done = time.time()
 
-        # Update each non-fresh worker.
-        stale_ranks = [r for r, d in worker_dirty.items() if d is None]
-        partial_ranks = [r for r, d in worker_dirty.items() if d is not None]
+        # Compute dirty blocks: union of all non-fresh workers.
+        # Stale workers (None) need all blocks; partial workers need their list.
+        all_blocks = list(range(len(client_hashes)))
+        dirty_blocks = set()
+        for rank, d in worker_dirty.items():
+            if d is None:
+                dirty_blocks = set(all_blocks)
+                break
+            dirty_blocks.update(d)
+        dirty_blocks = sorted(dirty_blocks)
 
-        for rank in partial_ranks:
-            actor = flat_actors.slice(rank=rank)
-            dirty = worker_dirty[rank]
+        target_ranks = sorted(worker_dirty.keys())
+
+        if dirty_blocks and target_ranks:
             logger.info(
-                f"Worker {rank}: {len(dirty)}/{len(client_hashes)} blocks dirty"
+                f"{len(dirty_blocks)}/{len(client_hashes)} blocks dirty "
+                f"across {len(target_ranks)} workers"
             )
-            self._transfer_blocks_rust_tls(actor, dirty, client_total_size)
-
-        t_partial_done = time.time()
-
-        if stale_ranks and staging_mv is not None:
-            # Rust TLS to leader, RDMA fan-out to peers (if any).
+            # TLS to leader, RDMA fan-out to all peers.
             self._transfer_fanout(
-                flat_actors, stale_ranks, staging_mv, chunks, client_total_size
+                flat_actors, target_ranks, dirty_blocks, client_total_size
             )
 
-            # Clean up the client-side pack file after all transfers.
-            if self._pack_shm_path is not None:
-                try:
-                    os.unlink(self._pack_shm_path)
-                except OSError:
-                    pass
-                self._pack_shm_path = None
+        # Clean up the client-side pack file after all transfers.
+        if self._pack_shm_path is not None:
+            try:
+                os.unlink(self._pack_shm_path)
+            except OSError:
+                pass
+            self._pack_shm_path = None
 
         t_transfer_done = time.time()
 
@@ -884,14 +993,13 @@ class MountHandler:
             f"classify={t_classify_done - t_pack_done:.2f}s, "
             f"set_meta={t_meta_done - t_classify_done:.2f}s, "
             f"unmount={t_unmount_done - t_meta_done:.2f}s, "
-            f"partial={t_partial_done - t_unmount_done:.2f}s, "
-            f"transfer={t_transfer_done - t_partial_done:.2f}s, "
+            f"transfer={t_transfer_done - t_unmount_done:.2f}s, "
             f"mount={t_mount_done - t_transfer_done:.2f}s, "
             f"total={t_mount_done - t_open_start:.2f}s"
         )
         return self
 
-    def _transfer_blocks_rust_tls(self, fuse_actor, dirty_blocks, total_size):
+    def _transfer_blocks_rust_tls(self, fuse_actor, dirty_blocks, total_size, rank=0):
         """Transfer dirty blocks to a single worker using Rust TLS.
 
         Sends blocks directly from ``self._staging_mv`` (the buffer produced
@@ -915,6 +1023,11 @@ class MountHandler:
 
         num_streams = self.num_parallel_streams
 
+        # When direct TLS tunnels are available, the number of streams
+        # is driven by the number of tunnel addresses (not the default).
+        if self.tls_addresses and rank < len(self.tls_addresses):
+            num_streams = len(self.tls_addresses[rank])
+
         # Get cache path from the FUSEActor.
         cache_result = fuse_actor.get_cache_path.call().get()
         cache_path = [v for _, v in cache_result][0]
@@ -931,8 +1044,18 @@ class MountHandler:
             # 1. Start receiver on worker.
             t_start = time.time()
             addr_result = fuse_actor.prepare_receiver.call(num_streams, total_size).get()
-            addr = [v for _, v in addr_result][0]
-            addresses = [addr] * num_streams
+
+            # Use direct TLS tunnel addresses if available (parallel kubectl
+            # port-forwards bypass the relay for higher throughput), otherwise
+            # fall back to replicating the relay-tunneled address.
+            if self.tls_addresses and rank < len(self.tls_addresses):
+                addresses = self.tls_addresses[rank]
+                logger.info(
+                    f"Using {len(addresses)} direct TLS tunnels for rank {rank}"
+                )
+            else:
+                addr = [v for _, v in addr_result][0]
+                addresses = [addr] * num_streams
 
             # 2. Fire receive_blocks (non-blocking) so worker starts waiting.
             recv_future = fuse_actor.receive_blocks.call()
@@ -970,53 +1093,73 @@ class MountHandler:
         )
 
     def _transfer_fanout(
-        self, flat_actors, stale_ranks, staging_mv, chunks, total_size
+        self, flat_actors, target_ranks, dirty_blocks, total_size
     ):
-        """Transfer data to leader via Rust TLS, then fan out to peers via RDMA.
+        """Transfer dirty blocks: TLS to leader, RDMA fan-out to peers."""
+        t0 = time.time()
 
-        Phase 1: Send full payload to stale_ranks[0] using Rust TLS.
-        Phase 2: Leader fans out each chunk to all other stale workers via RDMA.
+        total_bytes = sum(
+            min(HASH_BLOCK_SIZE, total_size - bi * HASH_BLOCK_SIZE)
+            for bi in dirty_blocks
+        )
 
-        Metadata must already be sent to all workers before calling this.
-        """
-        leader_rank = stale_ranks[0]
-        peer_ranks = stale_ranks[1:]
+        leader_rank = target_ranks[0]
+        peer_ranks = target_ranks[1:]
         leader = flat_actors.slice(rank=leader_rank)
 
-        chunk_sizes = [len(c) for c in chunks]
-        all_blocks = list(range((total_size + HASH_BLOCK_SIZE - 1) // HASH_BLOCK_SIZE))
+        # Ensure peers have storage allocated (parallel with TLS to leader).
+        ensure_futures = []
+        for rank in peer_ranks:
+            peer = flat_actors.slice(rank=rank)
+            ensure_futures.append(peer.ensure_storage.call(total_size))
 
-        # Phase 1: Rust TLS transfer to leader.
-        t0 = time.time()
-        self._transfer_blocks_rust_tls(leader, all_blocks, total_size)
-        t1 = time.time()
+        # Step 1: TLS transfer to leader (via direct tunnels if available).
+        self._transfer_blocks_rust_tls(leader, dirty_blocks, total_size, rank=leader_rank)
+        t_tls = time.time()
 
-        # Phase 2: RDMA fan-out from leader to peers (skip if single worker).
-        if peer_ranks:
+        # Wait for peer storage allocation.
+        for f in ensure_futures:
+            f.get()
+
+        if not peer_ranks:
+            logger.info(
+                f"TLS to leader: {total_bytes // (1024**2)}MiB "
+                f"({len(dirty_blocks)} blocks) in {t_tls - t0:.1f}s"
+            )
+            return
+
+        # Step 2: RDMA fan-out from leader to peers (fast, direct).
+        # Per-block: leader copies block into reusable anonymous staging,
+        # returns RDMABuffer, peers read from it.  Wait per block so the
+        # leader can safely overwrite its staging buffer for the next block.
+        for bi in dirty_blocks:
+            block_size = min(HASH_BLOCK_SIZE, total_size - bi * HASH_BLOCK_SIZE)
+
+            # Leader: copy block into anonymous staging, return RDMABuffer.
+            result = leader.get_block_rdma_buffer.call(bi, total_size).get()
+            rdma_buf = [v for _, v in result][0]
+
+            # All peers: read from leader via RDMA in parallel.
+            read_futures = []
             for rank in peer_ranks:
-                flat_actors.slice(rank=rank).init_chunk_storage.call(chunk_sizes).get()
-
-            # Build a mesh of peer FUSEActors for the fan-out call.
-            if peer_ranks == list(range(peer_ranks[0], peer_ranks[-1] + 1)):
-                peer_mesh = flat_actors.slice(
-                    rank=slice(peer_ranks[0], peer_ranks[-1] + 1)
+                peer = flat_actors.slice(rank=rank)
+                read_futures.append(
+                    peer.replace_block.call(bi, rdma_buf, block_size)
                 )
-            else:
-                peer_mesh = flat_actors.slice(rank=peer_ranks[0])
-                for rank in peer_ranks[1:]:
-                    peer_mesh = peer_mesh.concat(flat_actors.slice(rank=rank))
+            for f in read_futures:
+                f.get()
 
-            for i, chunk in enumerate(chunks):
-                leader.fanout_chunk_rdma.call(peer_mesh, len(chunk), chunk_idx=i).get()
-
-        t2 = time.time()
-        n_peers = len(peer_ranks)
-        total_elapsed = t2 - t0
-        gbps = (total_size * n_peers * 8.0 / 1e9) / max(t2 - t1, 1e-9)
+        t_rdma = time.time()
+        tls_gbps = (total_bytes * 8.0 / 1e9) / max(t_tls - t0, 1e-9)
+        rdma_gbps = (
+            (total_bytes * len(peer_ranks) * 8.0 / 1e9)
+            / max(t_rdma - t_tls, 1e-9)
+        )
         logger.info(
-            f"Fan-out: {total_size // (1024**2)}MiB to {n_peers + 1} workers "
-            f"in {total_elapsed:.1f}s (TLS={t1 - t0:.1f}s, "
-            f"RDMA={t2 - t1:.1f}s, {gbps:.1f} Gbps aggregate)"
+            f"TLS→leader: {total_bytes // (1024**2)}MiB in {t_tls - t0:.1f}s "
+            f"({tls_gbps:.1f} Gbps), "
+            f"RDMA fan-out: {len(dirty_blocks)} blocks to {len(peer_ranks)} "
+            f"peers in {t_rdma - t_tls:.1f}s ({rdma_gbps:.1f} Gbps)"
         )
 
     def close(self):
@@ -1045,10 +1188,12 @@ def remotemount(
     chunk_size=None,
     backend: str = "slurm",
     num_parallel_streams: int = 8,
+    tls_addresses=None,
 ):
     """Mount a local directory on remote hosts via RDMA transfer and FUSE."""
     if chunk_size is None:
         chunk_size = CHUNK_SIZE
     return MountHandler(
-        host_mesh, sourcepath, mntpoint, chunk_size, backend, num_parallel_streams
+        host_mesh, sourcepath, mntpoint, chunk_size, backend, num_parallel_streams,
+        tls_addresses=tls_addresses,
     )
