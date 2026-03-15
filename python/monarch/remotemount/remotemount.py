@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = (1024 * 1024 * 1024) * 8
 HASH_BLOCK_SIZE = 64 * 1024 * 1024  # 64MB blocks for incremental diffing
+RDMA_PARALLEL_TLS_THRESHOLD = 8  # blocks <= this: TLS to all workers; above: RDMA fan-out
 CACHE_DIR = "/tmp/monarch_remotemount_cache"
 FRAG_THRESHOLD = 0.2  # max dead-space ratio before sequential repack
 
@@ -589,6 +590,41 @@ class FUSEActor(Actor):
         return RDMABuffer(staging_slice)
 
     @endpoint
+    def get_blocks_rdma_buffer(self, block_indices, total_size):
+        """Copy multiple blocks into a contiguous staging buffer, return RDMABuffer.
+
+        Blocks are packed contiguously (no gaps). The caller MUST wait for
+        all peers to finish reading before calling this again.
+        """
+        import mmap as _mmap
+
+        from monarch.rdma import RDMABuffer
+
+        # Compute total staging size needed.
+        staging_needed = 0
+        for bi in block_indices:
+            staging_needed += min(HASH_BLOCK_SIZE, total_size - bi * HASH_BLOCK_SIZE)
+
+        # Grow staging buffer if needed.
+        if self._rdma_staging is None or len(self._rdma_staging) < staging_needed:
+            self._rdma_staging = _mmap.mmap(
+                -1, staging_needed, _mmap.MAP_PRIVATE | _mmap.MAP_ANONYMOUS
+            )
+            self._rdma_staging_mv = memoryview(self._rdma_staging)
+
+        # Copy blocks contiguously into staging.
+        pos = 0
+        for bi in block_indices:
+            block_size = min(HASH_BLOCK_SIZE, total_size - bi * HASH_BLOCK_SIZE)
+            offset = bi * HASH_BLOCK_SIZE
+            self._rdma_staging_mv[pos : pos + block_size] = (
+                self._chunk_storage_mv[offset : offset + block_size]
+            )
+            pos += block_size
+
+        return RDMABuffer(self._rdma_staging_mv[:staging_needed])
+
+    @endpoint
     def ensure_storage(self, total_size):
         """Ensure storage is allocated at the given size for RDMA reception."""
         import mmap as _mmap
@@ -658,6 +694,38 @@ class FUSEActor(Actor):
         else:
             dst_mv = self._chunk_storage_mv[offset : offset + block_size]
             rdma_buffer.read_into(dst_mv, timeout=timeout).get()
+
+    @endpoint
+    def replace_blocks(
+        self, block_indices, total_size, rdma_buffer, staging_size: int, timeout: int = 300
+    ):
+        """Overwrite multiple hash blocks from a single contiguous RDMA buffer.
+
+        The rdma_buffer contains blocks packed contiguously (matching the
+        order in block_indices). This reduces RDMA round-trips vs per-block.
+        """
+        import mmap as _mmap
+
+        # Always need staging: RDMA reads into contiguous buffer, then we
+        # scatter into the correct offsets in chunk storage.
+        if self._rdma_staging is None or len(self._rdma_staging) < staging_size:
+            self._rdma_staging = _mmap.mmap(
+                -1, staging_size, _mmap.MAP_PRIVATE | _mmap.MAP_ANONYMOUS
+            )
+            self._rdma_staging_mv = memoryview(self._rdma_staging)
+
+        staging_slice = self._rdma_staging_mv[:staging_size]
+        rdma_buffer.read_into(staging_slice, timeout=timeout).get()
+
+        # Scatter from contiguous staging into correct offsets.
+        pos = 0
+        for bi in block_indices:
+            block_size = min(HASH_BLOCK_SIZE, total_size - bi * HASH_BLOCK_SIZE)
+            offset = bi * HASH_BLOCK_SIZE
+            self._chunk_storage_mv[offset : offset + block_size] = (
+                staging_slice[pos : pos + block_size]
+            )
+            pos += block_size
 
     @endpoint
     def mount(self, mount_point, new_block_hashes=None, total_size=0, pack_index=None):
@@ -781,6 +849,7 @@ class MountHandler:
         backend: str = "slurm",
         num_parallel_streams: int = 8,
         tls_addresses=None,
+        on_tls_tunnel_error=None,
     ):
         self.sourcepath = sourcepath
         if mntpoint is None:
@@ -797,6 +866,7 @@ class MountHandler:
             )
         self.num_parallel_streams = num_parallel_streams
         self.tls_addresses = tls_addresses
+        self.on_tls_tunnel_error = on_tls_tunnel_error
         self._staging_mv = None
 
     def open(self):
@@ -1039,36 +1109,36 @@ class MountHandler:
             for bi in dirty_blocks
         )
 
-        max_attempts = 2
+        max_attempts = 3
         for attempt in range(max_attempts):
-            # 1. Start receiver on worker.
-            t_start = time.time()
-            addr_result = fuse_actor.prepare_receiver.call(num_streams, total_size).get()
-
-            # Use direct TLS tunnel addresses if available (parallel kubectl
-            # port-forwards bypass the relay for higher throughput), otherwise
-            # fall back to replicating the relay-tunneled address.
-            if self.tls_addresses and rank < len(self.tls_addresses):
-                addresses = self.tls_addresses[rank]
-                logger.info(
-                    f"Using {len(addresses)} direct TLS tunnels for rank {rank}"
-                )
-            else:
-                addr = [v for _, v in addr_result][0]
-                addresses = [addr] * num_streams
-
-            # 2. Fire receive_blocks (non-blocking) so worker starts waiting.
-            recv_future = fuse_actor.receive_blocks.call()
-
-            # 3. Send blocks directly from the staging buffer.
-            t_setup = time.time()
-            send_blocks_from_buffer(
-                self._staging_mv, total_size, dirty_blocks, addresses, cache_path
-            )
-            t_send = time.time()
-
-            # 4. Wait for receiver to finish.
             try:
+                # 1. Start receiver on worker.
+                t_start = time.time()
+                addr_result = fuse_actor.prepare_receiver.call(num_streams, total_size).get()
+
+                # Use direct TLS tunnel addresses if available (parallel kubectl
+                # port-forwards bypass the relay for higher throughput), otherwise
+                # fall back to replicating the relay-tunneled address.
+                if self.tls_addresses and rank < len(self.tls_addresses):
+                    addresses = self.tls_addresses[rank]
+                    logger.info(
+                        f"Using {len(addresses)} direct TLS tunnels for rank {rank}"
+                    )
+                else:
+                    addr = [v for _, v in addr_result][0]
+                    addresses = [addr] * num_streams
+
+                # 2. Fire receive_blocks (non-blocking) so worker starts waiting.
+                recv_future = fuse_actor.receive_blocks.call()
+
+                # 3. Send blocks directly from the staging buffer.
+                t_setup = time.time()
+                send_blocks_from_buffer(
+                    self._staging_mv, total_size, dirty_blocks, addresses, cache_path
+                )
+                t_send = time.time()
+
+                # 4. Wait for receiver to finish.
                 recv_future.get()
             except Exception:
                 if attempt < max_attempts - 1:
@@ -1077,6 +1147,10 @@ class MountHandler:
                         f"retrying...",
                         exc_info=True,
                     )
+                    # Let the caller restart dead tunnels before retry.
+                    if self.on_tls_tunnel_error:
+                        self.on_tls_tunnel_error()
+                    time.sleep(2)
                     continue
                 raise
             break
@@ -1095,7 +1169,15 @@ class MountHandler:
     def _transfer_fanout(
         self, flat_actors, target_ranks, dirty_blocks, total_size
     ):
-        """Transfer dirty blocks: TLS to leader, RDMA fan-out to peers."""
+        """Transfer dirty blocks: TLS to leader, RDMA fan-out to peers.
+
+        Small incremental transfers (≤ RDMA_PARALLEL_TLS_THRESHOLD blocks)
+        go directly via TLS to each worker in parallel — faster than any
+        RDMA round-trip for small payloads.
+
+        Large transfers use TLS to the leader, then a single RDMA fan-out
+        to all peers (one staging + one RDMA read per peer).
+        """
         t0 = time.time()
 
         total_bytes = sum(
@@ -1107,13 +1189,58 @@ class MountHandler:
         peer_ranks = target_ranks[1:]
         leader = flat_actors.slice(rank=leader_rank)
 
+        # Small incremental: TLS to every worker in parallel (no RDMA).
+        if len(dirty_blocks) <= RDMA_PARALLEL_TLS_THRESHOLD or not peer_ranks:
+            tls_futures = []
+            for rank in target_ranks:
+                worker = flat_actors.slice(rank=rank)
+                tls_futures.append((rank, worker))
+
+            # Ensure all workers have storage allocated.
+            ensure_futures = []
+            for rank, worker in tls_futures:
+                ensure_futures.append(worker.ensure_storage.call(total_size))
+            for f in ensure_futures:
+                f.get()
+
+            # TLS to each worker in parallel (non-blocking sends).
+            import threading
+            errors = []
+            def _tls_to_worker(rank, worker):
+                try:
+                    self._transfer_blocks_rust_tls(
+                        worker, dirty_blocks, total_size, rank=rank
+                    )
+                except Exception as e:
+                    errors.append((rank, e))
+
+            threads = []
+            for rank, worker in tls_futures:
+                t = threading.Thread(target=_tls_to_worker, args=(rank, worker))
+                t.start()
+                threads.append(t)
+            for t in threads:
+                t.join()
+
+            t_done = time.time()
+            if errors:
+                raise errors[0][1]
+            logger.info(
+                f"Parallel TLS to {len(target_ranks)} workers: "
+                f"{total_bytes // (1024**2)}MiB "
+                f"({len(dirty_blocks)} blocks) in {t_done - t0:.1f}s"
+            )
+            return
+
+        # Large transfer: TLS to leader, single RDMA fan-out to peers.
+
         # Ensure peers have storage allocated (parallel with TLS to leader).
         ensure_futures = []
         for rank in peer_ranks:
             peer = flat_actors.slice(rank=rank)
             ensure_futures.append(peer.ensure_storage.call(total_size))
 
-        # Step 1: TLS transfer to leader (via direct tunnels if available).
+        # Step 1: TLS transfer to leader.
         self._transfer_blocks_rust_tls(leader, dirty_blocks, total_size, rank=leader_rank)
         t_tls = time.time()
 
@@ -1121,33 +1248,21 @@ class MountHandler:
         for f in ensure_futures:
             f.get()
 
-        if not peer_ranks:
-            logger.info(
-                f"TLS to leader: {total_bytes // (1024**2)}MiB "
-                f"({len(dirty_blocks)} blocks) in {t_tls - t0:.1f}s"
+        # Step 2: Single RDMA fan-out — all dirty blocks in one shot.
+        # One RPC to leader (stage all blocks), one RPC per peer (read all).
+        staging_size = total_bytes
+
+        result = leader.get_blocks_rdma_buffer.call(dirty_blocks, total_size).get()
+        rdma_buf = [v for _, v in result][0]
+
+        read_futures = []
+        for rank in peer_ranks:
+            peer = flat_actors.slice(rank=rank)
+            read_futures.append(
+                peer.replace_blocks.call(dirty_blocks, total_size, rdma_buf, staging_size)
             )
-            return
-
-        # Step 2: RDMA fan-out from leader to peers (fast, direct).
-        # Per-block: leader copies block into reusable anonymous staging,
-        # returns RDMABuffer, peers read from it.  Wait per block so the
-        # leader can safely overwrite its staging buffer for the next block.
-        for bi in dirty_blocks:
-            block_size = min(HASH_BLOCK_SIZE, total_size - bi * HASH_BLOCK_SIZE)
-
-            # Leader: copy block into anonymous staging, return RDMABuffer.
-            result = leader.get_block_rdma_buffer.call(bi, total_size).get()
-            rdma_buf = [v for _, v in result][0]
-
-            # All peers: read from leader via RDMA in parallel.
-            read_futures = []
-            for rank in peer_ranks:
-                peer = flat_actors.slice(rank=rank)
-                read_futures.append(
-                    peer.replace_block.call(bi, rdma_buf, block_size)
-                )
-            for f in read_futures:
-                f.get()
+        for f in read_futures:
+            f.get()
 
         t_rdma = time.time()
         tls_gbps = (total_bytes * 8.0 / 1e9) / max(t_tls - t0, 1e-9)
@@ -1189,6 +1304,7 @@ def remotemount(
     backend: str = "slurm",
     num_parallel_streams: int = 8,
     tls_addresses=None,
+    on_tls_tunnel_error=None,
 ):
     """Mount a local directory on remote hosts via RDMA transfer and FUSE."""
     if chunk_size is None:
@@ -1196,4 +1312,5 @@ def remotemount(
     return MountHandler(
         host_mesh, sourcepath, mntpoint, chunk_size, backend, num_parallel_streams,
         tls_addresses=tls_addresses,
+        on_tls_tunnel_error=on_tls_tunnel_error,
     )
