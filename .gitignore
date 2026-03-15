@@ -41,3 +41,4 @@ docs/**/generated/**
 
 .venv/**
 .vscode/**
+.kfair/
